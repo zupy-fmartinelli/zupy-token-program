@@ -19,3 +19,7 @@ test-ledger/
 # Coverage
 lcov.info
 cobertura.xml
+
+# SonarQube
+sonar-project.properties
+.scannerwork/
