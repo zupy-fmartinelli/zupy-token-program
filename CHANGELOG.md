@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
+## [1.1.0](https://github.com/zupy-fmartinelli/zupy-token-program/compare/v1.0.1...v1.1.0) (2026-02-28)
+
+
+### Features
+
+* embed security.txt in program binary ([4019234](https://github.com/zupy-fmartinelli/zupy-token-program/commit/4019234fb0ff189cf90486a20983b0e313893b3a))
+
 ## [1.0.1](https://github.com/zupy-fmartinelli/zupy-token-program/compare/v1.0.0...v1.0.1) (2026-02-28)
 
 
