@@ -19,7 +19,8 @@ security_txt! {
     preferred_languages: "en,pt",
     source_code: "https://github.com/zupy-fmartinelli/zupy-token-program",
     auditors: "N/A",
-    expiry: "2027-02-28"
+    expiry: "2027-02-28",
+    logo: "https://cdn.zupy.com/static/images/token/zupy-coin-purple-512.png"
 }
 
 entrypoint!(process_instruction);
