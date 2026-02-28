@@ -1,0 +1,184 @@
+name: Semantic Version Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: semantic-release
+  cancel-in-progress: false
+
+jobs:
+  # Wait for SonarQube to pass before releasing
+  check-quality:
+    name: Check Quality Gate
+    runs-on: ubuntu-latest
+    outputs:
+      sonar-success: ${{ steps.wait-sonar.outputs.conclusion }}
+    steps:
+      - name: Wait for SonarQube workflow
+        id: wait-sonar
+        uses: fountainhead/action-wait-for-check@v1.2.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          checkName: "SonarQube Scan"
+          ref: ${{ github.sha }}
+          timeoutSeconds: 900
+          intervalSeconds: 15
+
+  semantic-version:
+    needs: check-quality
+    if: needs.check-quality.outputs.sonar-success == 'success'
+    name: Generate Semantic Version
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: true
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install semantic-release
+        run: |
+          npm install -g semantic-release@22
+          npm install -g @semantic-release/changelog@6
+          npm install -g @semantic-release/git@10
+          npm install -g @semantic-release/github@9
+          npm install -g @semantic-release/exec@6
+          npm install -g @semantic-release/commit-analyzer@11
+          npm install -g @semantic-release/release-notes-generator@12
+          npm install -g conventional-changelog-conventionalcommits@7
+
+      - name: Create semantic-release configuration
+        run: |
+          cat > .releaserc.json << 'RCEOF'
+          {
+            "branches": ["main"],
+            "plugins": [
+              [
+                "@semantic-release/commit-analyzer",
+                {
+                  "preset": "conventionalcommits",
+                  "releaseRules": [
+                    {"type": "feat", "release": "minor"},
+                    {"type": "fix", "release": "patch"},
+                    {"type": "perf", "release": "patch"},
+                    {"type": "revert", "release": "patch"},
+                    {"type": "refactor", "release": "patch"},
+                    {"type": "docs", "release": false},
+                    {"type": "style", "release": false},
+                    {"type": "chore", "release": false},
+                    {"type": "test", "release": false},
+                    {"type": "build", "release": false},
+                    {"type": "ci", "release": false}
+                  ],
+                  "parserOpts": {
+                    "noteKeywords": ["BREAKING CHANGE", "BREAKING CHANGES", "BREAKING"]
+                  }
+                }
+              ],
+              [
+                "@semantic-release/release-notes-generator",
+                {
+                  "preset": "conventionalcommits",
+                  "presetConfig": {
+                    "types": [
+                      {"type": "feat", "section": "Features"},
+                      {"type": "fix", "section": "Bug Fixes"},
+                      {"type": "perf", "section": "Performance Improvements"},
+                      {"type": "revert", "section": "Reverts"},
+                      {"type": "refactor", "section": "Code Refactoring"},
+                      {"type": "docs", "section": "Documentation", "hidden": true},
+                      {"type": "style", "section": "Styles", "hidden": true},
+                      {"type": "chore", "section": "Miscellaneous", "hidden": true},
+                      {"type": "test", "section": "Tests", "hidden": true},
+                      {"type": "build", "section": "Build System", "hidden": true},
+                      {"type": "ci", "section": "CI", "hidden": true}
+                    ]
+                  }
+                }
+              ],
+              [
+                "@semantic-release/exec",
+                {
+                  "prepareCmd": "sed -i 's/^version = \".*\"/version = \"${nextRelease.version}\"/' Cargo.toml"
+                }
+              ],
+              [
+                "@semantic-release/changelog",
+                {
+                  "changelogFile": "CHANGELOG.md",
+                  "changelogTitle": "# Changelog\n\nAll notable changes to this project will be documented in this file.\n\nThe format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),\nand this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).\n\n"
+                }
+              ],
+              [
+                "@semantic-release/github",
+                {
+                  "assets": []
+                }
+              ],
+              [
+                "@semantic-release/git",
+                {
+                  "assets": ["CHANGELOG.md", "Cargo.toml"],
+                  "message": "chore(release): ${nextRelease.version} [skip ci]\n\n${nextRelease.notes}"
+                }
+              ]
+            ]
+          }
+          RCEOF
+
+      - name: Run semantic release
+        id: semantic
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BEFORE_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+          echo "Current tag: $BEFORE_TAG"
+
+          set +e
+          semantic-release --dry-run=false
+          SEMANTIC_EXIT_CODE=$?
+          set -e
+
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          echo "Latest tag: $LATEST_TAG"
+
+          if [[ -n "$LATEST_TAG" && "$LATEST_TAG" != "$BEFORE_TAG" ]]; then
+            echo "version=${LATEST_TAG#v}" >> $GITHUB_OUTPUT
+            echo "tag=${LATEST_TAG}" >> $GITHUB_OUTPUT
+            echo "new-release-published=true" >> $GITHUB_OUTPUT
+            echo "New version: $LATEST_TAG"
+          else
+            echo "version=${BEFORE_TAG#v}" >> $GITHUB_OUTPUT
+            echo "tag=${BEFORE_TAG}" >> $GITHUB_OUTPUT
+            echo "new-release-published=false" >> $GITHUB_OUTPUT
+            echo "No new version needed"
+            if [[ $SEMANTIC_EXIT_CODE -ne 0 ]]; then
+              echo "semantic-release failed with exit code $SEMANTIC_EXIT_CODE"
+              exit $SEMANTIC_EXIT_CODE
+            fi
+          fi
+
+      - name: Display version
+        run: |
+          echo "Version: ${{ steps.semantic.outputs.version }}"
+          echo "Tag: ${{ steps.semantic.outputs.tag }}"
+          echo "New Release: ${{ steps.semantic.outputs.has-new-release }}"
