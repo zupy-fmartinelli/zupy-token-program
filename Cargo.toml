@@ -1,6 +1,6 @@
 [package]
 name = "zupy-token-program"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 description = "Solana program for the ZUPY token ecosystem"
 license = "Apache-2.0"

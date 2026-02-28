@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
+## [1.2.0](https://github.com/zupy-fmartinelli/zupy-token-program/compare/v1.1.0...v1.2.0) (2026-02-28)
+
+
+### Features
+
+* add logo field to security_txt for Solana Explorer display ([e22e9a9](https://github.com/zupy-fmartinelli/zupy-token-program/commit/e22e9a98dfd2c655fabc658365497359738bf013))
+
+
+### Code Refactoring
+
+* rename crate from zupy-pinocchio to zupy-token-program ([b97f80a](https://github.com/zupy-fmartinelli/zupy-token-program/commit/b97f80aa2cc8fb48b4da7d3d81d9a66b2bb06650))
+
 ## [1.1.0](https://github.com/zupy-fmartinelli/zupy-token-program/compare/v1.0.1...v1.1.0) (2026-02-28)
 
 
