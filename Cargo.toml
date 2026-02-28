@@ -1,6 +1,6 @@
 [package]
 name = "zupy-pinocchio"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "Solana program for the ZUPY token ecosystem"
 license = "Apache-2.0"
