@@ -44,4 +44,16 @@ jobs:
         uses: SonarSource/sonarqube-scan-action@v4
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: https://sonar.zupers.com.br
+          SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ secrets.SONAR_PROJECT_KEY }}
+            -Dsonar.sources=src
+            -Dsonar.tests=src,tests
+            -Dsonar.test.inclusions=**/tests/**,**/tests.rs,**/mod.rs
+            -Dsonar.language=rust
+            -Dsonar.sourceEncoding=UTF-8
+            -Dsonar.exclusions=**/target/**,**/*.lock,**/test-ledger/**
+            -Dsonar.rust.lcov.reportPaths=lcov.info
+            -Dsonar.qualitygate.wait=true
+            -Dsonar.scm.disabled=false
