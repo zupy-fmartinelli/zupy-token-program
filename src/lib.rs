@@ -7,6 +7,21 @@ pub mod helpers;
 pub mod instructions;
 pub mod state;
 
+#[cfg(not(feature = "no-entrypoint"))]
+use solana_security_txt::security_txt;
+
+#[cfg(not(feature = "no-entrypoint"))]
+security_txt! {
+    name: "ZUPY Token Program",
+    project_url: "https://zupy.com",
+    contacts: "email:security@zupy.com",
+    policy: "https://github.com/zupy-fmartinelli/zupy-token-program/blob/main/SECURITY.md",
+    preferred_languages: "en,pt",
+    source_code: "https://github.com/zupy-fmartinelli/zupy-token-program",
+    auditors: "N/A",
+    expiry: "2027-02-28"
+}
+
 entrypoint!(process_instruction);
 
 pub fn process_instruction(

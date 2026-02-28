@@ -14,6 +14,7 @@ default = ["devnet"]
 devnet = []
 production = []
 mainnet = ["production"]
+no-entrypoint = []
 
 [dependencies]
 pinocchio = { version = "0.10", features = ["cpi"] }
@@ -24,6 +25,7 @@ five8_const = "1.0"
 solana-address = { version = "2.0", features = ["curve25519"] }
 light-sdk-pinocchio = { version = "0.22.0", features = ["light-account"] }
 light-token-pinocchio = "0.22.0"
+solana-security-txt = "1.1.2"
 
 [dev-dependencies]
 mollusk-svm = "0.10"
