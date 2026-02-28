@@ -622,7 +622,7 @@ mod return_to_pool {
 
 mod transfer_company_to_user {
     use super::*;
-    use zupy_pinocchio::constants::LIGHT_COMPRESSED_TOKEN_PROGRAM_ID;
+    use zupy_token_program::constants::LIGHT_COMPRESSED_TOKEN_PROGRAM_ID;
 
     pub(super) fn ctoken_program_id() -> Pubkey {
         Pubkey::new_from_array(LIGHT_COMPRESSED_TOKEN_PROGRAM_ID)
@@ -1018,7 +1018,7 @@ mod transfer_company_to_user {
 
 mod transfer_user_to_company {
     use super::*;
-    use zupy_pinocchio::constants::LIGHT_COMPRESSED_TOKEN_PROGRAM_ID;
+    use zupy_token_program::constants::LIGHT_COMPRESSED_TOKEN_PROGRAM_ID;
 
     pub(super) fn ctoken_program_id() -> Pubkey {
         Pubkey::new_from_array(LIGHT_COMPRESSED_TOKEN_PROGRAM_ID)

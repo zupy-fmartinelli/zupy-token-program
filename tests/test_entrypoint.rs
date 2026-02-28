@@ -1,4 +1,4 @@
-//! Mollusk CU benchmark template for zupy-pinocchio.
+//! Mollusk CU benchmark template for zupy-token-program.
 //!
 //! Requires `cargo build-sbf` before running:
 //!   cargo build-sbf && cargo test --test test_entrypoint

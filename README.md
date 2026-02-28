@@ -39,7 +39,7 @@ This program is verified on [Solana Explorer](https://explorer.solana.com/). To 
 
 ```bash
 solana-verify get-program-hash ZUPYzr87cgminBywohtbUxnaiFMwXNy8A5pD9cCcvVU
-solana-verify get-executable-hash target/deploy/zupy_pinocchio.so
+solana-verify get-executable-hash target/deploy/zupy_token_program.so
 ```
 
 Both hashes must match.

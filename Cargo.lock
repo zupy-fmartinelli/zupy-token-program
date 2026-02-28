@@ -10487,7 +10487,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "zupy-pinocchio"
+name = "zupy-token-program"
 version = "1.1.0"
 dependencies = [
  "five8_const 1.0.0",

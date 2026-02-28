@@ -14,7 +14,7 @@ use solana_instruction::{AccountMeta, Instruction};
 use solana_pubkey::Pubkey;
 
 use helpers::*;
-use zupy_pinocchio::constants::LIGHT_COMPRESSED_TOKEN_PROGRAM_ID;
+use zupy_token_program::constants::LIGHT_COMPRESSED_TOKEN_PROGRAM_ID;
 
 // ── Instruction discriminators (all 17) ──────────────────────────────────
 
@@ -1355,7 +1355,7 @@ fn test_cu_error_paths() {
 fn test_binary_size() {
     let binary_path = std::env::var("SBF_OUT_DIR")
         .unwrap_or_else(|_| "target/deploy".to_string());
-    let so_path = format!("{}/zupy_pinocchio.so", binary_path);
+    let so_path = format!("{}/zupy_token_program.so", binary_path);
 
     let metadata = std::fs::metadata(&so_path)
         .unwrap_or_else(|_| panic!("Binary not found at {}. Run cargo build-sbf first.", so_path));
@@ -1736,7 +1736,7 @@ fn test_cu_benchmark_report() {
 
     // ── Print Report ─────────────────────────────────────────────────────
     let binary_path = std::env::var("SBF_OUT_DIR").unwrap_or_else(|_| "target/deploy".to_string());
-    let so_path = format!("{}/zupy_pinocchio.so", binary_path);
+    let so_path = format!("{}/zupy_token_program.so", binary_path);
     let binary_size = std::fs::metadata(&so_path).map(|m| m.len()).unwrap_or(0);
     let binary_kb = binary_size as f64 / 1024.0;
     let deploy_cost = binary_kb * 0.00482;

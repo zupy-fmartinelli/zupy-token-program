@@ -16,7 +16,7 @@ use solana_instruction::error::InstructionError;
 use solana_instruction::{AccountMeta, Instruction};
 use solana_pubkey::Pubkey;
 
-use zupy_pinocchio::state::token_state::TOKEN_STATE_SIZE;
+use zupy_token_program::state::token_state::TOKEN_STATE_SIZE;
 
 // ── Instruction discriminators ─────────────────────────────────────────────
 const DISC_EXECUTE_SPLIT_TRANSFER: [u8; 8] = [51, 254, 61, 214, 234, 138, 101, 214];
@@ -1023,7 +1023,7 @@ mod burn_tokens {
 
 mod burn_from_company_pda {
     use super::*;
-    use zupy_pinocchio::constants::LIGHT_COMPRESSED_TOKEN_PROGRAM_ID;
+    use zupy_token_program::constants::LIGHT_COMPRESSED_TOKEN_PROGRAM_ID;
 
     fn ctoken_program_id() -> Pubkey {
         Pubkey::new_from_array(LIGHT_COMPRESSED_TOKEN_PROGRAM_ID)
@@ -1532,7 +1532,7 @@ fn test_cu_benchmark_all_split_burn_instructions() {
         let company_id: u64 = 42;
         let (company_pda, _) = derive_company_pda(company_id);
         let fee_payer = Pubkey::new_unique();
-        let ctoken_prog = Pubkey::new_from_array(zupy_pinocchio::constants::LIGHT_COMPRESSED_TOKEN_PROGRAM_ID);
+        let ctoken_prog = Pubkey::new_from_array(zupy_token_program::constants::LIGHT_COMPRESSED_TOKEN_PROGRAM_ID);
 
         let ts_data = make_split_token_state(
             &Pubkey::new_unique(), &transfer_auth, &mint, &Pubkey::new_unique(),

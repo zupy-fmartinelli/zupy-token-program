@@ -9,7 +9,7 @@ use solana_account::Account;
 use solana_instruction::error::InstructionError;
 use solana_pubkey::Pubkey;
 
-use zupy_pinocchio::constants::{
+use zupy_token_program::constants::{
     ATA_PROGRAM_ID, PROGRAM_ID, SYSTEM_PROGRAM_ID, TOKEN_2022_PROGRAM_ID, TOKEN_STATE_SEED,
     COMPANY_SEED, USER_SEED, INCENTIVE_POOL_SEED, DISTRIBUTION_POOL_SEED,
     RATE_LIMIT_SEED, ZUPY_CARD_SEED, ZUPY_CARD_MINT_SEED, COUPON_SEED,
@@ -19,7 +19,7 @@ use zupy_pinocchio::constants::{
     LIGHT_SYSTEM_PROGRAM_ID, REGISTERED_PROGRAM_PDA,
     ACCOUNT_COMPRESSION_AUTHORITY, ACCOUNT_COMPRESSION_PROGRAM_ID,
 };
-use zupy_pinocchio::state::token_state::{TOKEN_STATE_DISCRIMINATOR, TOKEN_STATE_SIZE};
+use zupy_token_program::state::token_state::{TOKEN_STATE_DISCRIMINATOR, TOKEN_STATE_SIZE};
 
 // ── Light Protocol PDA helpers ───────────────────────────────────────────
 
@@ -97,7 +97,7 @@ pub fn account_compression_program_id() -> Pubkey {
 
 /// Create Mollusk with just our program (for validation-path benchmarks).
 pub fn setup_mollusk() -> Mollusk {
-    Mollusk::new(&program_id(), "zupy_pinocchio")
+    Mollusk::new(&program_id(), "zupy_token_program")
 }
 
 /// Create Mollusk with Token-2022, ATA, and System programs loaded.

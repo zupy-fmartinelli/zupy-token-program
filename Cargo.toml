@@ -1,5 +1,5 @@
 [package]
-name = "zupy-pinocchio"
+name = "zupy-token-program"
 version = "1.1.0"
 edition = "2021"
 description = "Solana program for the ZUPY token ecosystem"
