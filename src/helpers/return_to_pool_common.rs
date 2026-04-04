@@ -158,7 +158,9 @@ pub fn decompress_to_pool(
     Ok(())
 }
 
-/// V1 CPI passthrough: forwards pre-built V1 TRANSFER to mainnet cToken program.
+/// DEPRECATED (2026-04-04): Mainnet cToken upgraded to V2. Use `decompress_to_pool` instead.
+///
+/// V1 CPI passthrough: forwards pre-built V1 TRANSFER to cToken program.
 ///
 /// Accounts (minimum 6 + CPI accounts):
 ///   0. transfer_authority        (signer)

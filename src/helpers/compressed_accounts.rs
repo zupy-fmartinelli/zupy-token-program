@@ -35,21 +35,31 @@
 //! (`cTokenmWW8bLPjZEBAUgYy3zKxQZW6VKi7bqNFEVv3m`). This is the current live interface —
 //! NOT a legacy value. `compress_spl_token_account` remains Anchor 8-byte (separate codepath).
 //!
-//! ## Mainnet V1/V2 Incompatibility
+//! ## Mainnet V2 (Upgraded 2026-04-04 verified)
 //!
-//! **Mainnet** cToken runs V1 (Anchor-based, 642KB). **Devnet** runs V2
-//! (Pinocchio-based, 1.2MB). No public Light Protocol upgrade timeline exists.
+//! Both **mainnet** and **devnet** now run cToken V2. Light Protocol upgraded
+//! mainnet at slot ~405,926,389 (binary: 1.15MB, was 642KB V1).
+//! Binary analysis confirmed: Transfer2, Decompress, CTokenBurn handlers present;
+//! V1 Anchor dispatch (`global:transfer`) NOT found in mainnet binary.
 //!
-//! | Operation | V1 Disc | V2 Disc | Mainnet Status |
-//! |-----------|---------|---------|----------------|
-//! | `compress_spl_token_account` | 8-byte Anchor | 8-byte Anchor | **WORKS** |
-//! | Transfer2 (decompress/transfer) | N/A | disc=101 | **BLOCKED** |
-//! | Transfer (V1 unified) | `[163,52,200,231,140,3,69,186]` | N/A | **WORKS** |
-//! | Burn | N/A | disc=8 | **BLOCKED** |
+//! | Operation | Disc | Mainnet Status |
+//! |-----------|------|----------------|
+//! | `compress_spl_token_account` | 8-byte Anchor | **WORKS** |
+//! | Transfer2 (decompress/transfer) | disc=101 | **WORKS** |
+//! | Compressed transfer | disc=3 | **WORKS** |
+//! | Burn | disc=8 | **WORKS** |
 //!
-//! For mainnet decompress operations, use [`TRANSFER_V1_DISC`] with the V1 CPI passthrough
-//! instruction (`return_user_to_pool_v1`). The backend builds the full V1 Borsh
-//! `CompressedTokenInstructionDataTransfer` and our on-chain program validates + forwards.
+//! All V2 operations are available on mainnet. The V1 CPI passthrough instructions
+//! (`return_to_pool_v1`, `return_user_to_pool_v1`) are **DEPRECATED** — the V1
+//! TRANSFER discriminator `[163,52,200,231,140,3,69,186]` is no longer present
+//! in the mainnet binary. Use the native V2 instructions (`return_to_pool`,
+//! `return_user_to_pool`) instead.
+//!
+//! ### Historical Note (pre-2026-04)
+//!
+//! Before slot ~405M, mainnet ran V1 (Anchor-based, 642KB, slot 351672434).
+//! Transfer2 (disc=101) and Burn (disc=8) were BLOCKED, requiring V1 CPI
+//! passthrough via `TRANSFER_V1_DISC`. See sprint-change-proposal-2026-02-19.md.
 
 use pinocchio::AccountView;
 use pinocchio::Address;
@@ -77,18 +87,15 @@ const COMPRESS_SPL_TOKEN_ACCOUNT_DISC: [u8; 8] = [112, 230, 105, 101, 145, 202, 
 /// Note: Transfer2 dispatches via a 1-byte discriminator, not an Anchor instruction name.
 const TRANSFER2_DISC: u8 = 101;
 
+/// DEPRECATED (2026-04-04): Mainnet cToken upgraded to V2 (slot ~405M).
+/// V1 Anchor dispatch (`global:transfer`) no longer present in mainnet binary.
+/// Use Transfer2 (disc=101) via the native `return_to_pool` / `return_user_to_pool`
+/// instructions instead.
+///
 /// V1 TRANSFER discriminator for the Light cToken program (Anchor 8-byte).
-///
 /// = SHA256("global:transfer")[0..8]
-/// Used by **mainnet** V1 cToken for ALL transfer operations (compress, decompress,
-/// compressed-to-compressed). Decompress mode uses `is_compress = false` with
-/// `compress_or_decompress_amount = Some(amount)`.
-///
-/// The backend builds the full V1 `CompressedTokenInstructionDataTransfer` in Borsh
-/// format and passes it to the `return_user_to_pool_v1` instruction for CPI passthrough.
-///
-/// **Context:** Mainnet cToken (`cTokenmWW8bLPjZEBAUgYy3zKxQZW6VKi7bqNFEVv3m`) runs V1
-/// (Anchor-based, 642KB). Transfer2 (disc=101) only works on devnet V2.
+/// Was used by mainnet V1 cToken for ALL transfer operations.
+/// Retained for the `return_*_v1` passthrough instructions (also deprecated).
 pub(crate) const TRANSFER_V1_DISC: [u8; 8] = [163, 52, 200, 231, 140, 3, 69, 186];
 
 /// Validates that raw CPI data starts with the V1 TRANSFER discriminator.

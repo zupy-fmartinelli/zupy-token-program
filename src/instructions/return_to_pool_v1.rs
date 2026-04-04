@@ -3,9 +3,14 @@ use pinocchio::{AccountView, Address, ProgramResult};
 use crate::constants::COMPANY_SEED;
 use crate::helpers::return_to_pool_common::v1_passthrough_to_pool;
 
-/// Process `return_to_pool_v1` instruction (V1 CPI passthrough, mainnet).
+/// DEPRECATED (2026-04-04): Mainnet cToken upgraded to V2 (slot ~405M).
+/// V1 TRANSFER discriminator no longer present in mainnet binary.
+/// Use `return_to_pool` (instruction #7, V2 native) instead.
+/// Retained in the program binary for backwards compatibility — not called by backend.
 ///
-/// Forwards a pre-built V1 TRANSFER instruction to the mainnet cToken program,
+/// Process `return_to_pool_v1` instruction (V1 CPI passthrough, formerly mainnet-only).
+///
+/// Forwards a pre-built V1 TRANSFER instruction to the cToken program,
 /// signing with company PDA seeds via `invoke_signed`.
 ///
 /// Delegates to [`v1_passthrough_to_pool`] with `COMPANY_SEED`.
