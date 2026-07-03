@@ -71,12 +71,13 @@ pub fn validate_token_state_base(
 /// 9. token_program is Token-2022 program ID (Spec §7.8)
 ///
 /// Returns the token_state bump for use in PDA signing.
-pub fn validate_transfer_common(
+/// Checks 1–8 shared by both transfer-validation variants — extracted to dedup
+/// `validate_transfer_common` and `validate_transfer_common_compressed`.
+fn validate_transfer_common_1_8(
     program_id: &Address,
     token_state_account: &AccountView,
     transfer_authority: &AccountView,
     mint: &AccountView,
-    token_program: &AccountView,
 ) -> Result<TransferValidationResult, ProgramError> {
     // 1–4. Base token_state validation
     let bump = validate_token_state_base(program_id, token_state_account)?;
@@ -108,12 +109,26 @@ pub fn validate_transfer_common(
         return Err(ZupyTokenError::InvalidMint.into());
     }
 
+    Ok(TransferValidationResult { bump })
+}
+
+pub fn validate_transfer_common(
+    program_id: &Address,
+    token_state_account: &AccountView,
+    transfer_authority: &AccountView,
+    mint: &AccountView,
+    token_program: &AccountView,
+) -> Result<TransferValidationResult, ProgramError> {
+    // Checks 1–8 (shared).
+    let result = validate_transfer_common_1_8(program_id, token_state_account, transfer_authority, mint)?;
+
     // 9. token_program is Token-2022
+    let token_2022_addr = Address::from(TOKEN_2022_PROGRAM_ID);
     if token_program.address() != &token_2022_addr {
         return Err(ZupyTokenError::InvalidTokenProgram.into());
     }
 
-    Ok(TransferValidationResult { bump })
+    Ok(result)
 }
 
 /// Common validation for compressed-token transfer instructions.
@@ -137,36 +152,9 @@ pub fn validate_transfer_common_compressed(
     transfer_authority: &AccountView,
     mint: &AccountView,
 ) -> Result<TransferValidationResult, ProgramError> {
-    // 1–4. Base token_state validation
-    let bump = validate_token_state_base(program_id, token_state_account)?;
-
-    let state = TokenState::from_slice(unsafe { token_state_account.borrow_unchecked() });
-
-    // 5. not paused
-    if state.paused() {
-        return Err(ZupyTokenError::SystemPaused.into());
-    }
-
-    // 6. transfer_authority matches
-    if !transfer_authority.is_signer() {
-        return Err(ZupyTokenError::InvalidAuthority.into());
-    }
-    if state.transfer_authority() != transfer_authority.address().as_ref() {
-        return Err(ZupyTokenError::InvalidAuthority.into());
-    }
-
-    // 7. mint owned by Token-2022
-    let token_2022_addr = Address::from(TOKEN_2022_PROGRAM_ID);
-    if !mint.owned_by(&token_2022_addr) {
-        return Err(ZupyTokenError::InvalidMint.into());
-    }
-
-    // 8. token_state.mint matches
-    if state.mint() != mint.address().as_ref() {
-        return Err(ZupyTokenError::InvalidMint.into());
-    }
-
-    Ok(TransferValidationResult { bump })
+    // Checks 1–8 (shared); compressed instructions skip check 9 — they perform no
+    // ATA/token_program operation, so there is no token_program account to verify.
+    validate_transfer_common_1_8(program_id, token_state_account, transfer_authority, mint)
 }
 
 /// Validate common metadata instruction accounts.

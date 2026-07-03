@@ -69,6 +69,22 @@ use pinocchio::instruction::{InstructionAccount, InstructionView};
 
 use crate::constants::{LIGHT_COMPRESSED_TOKEN_PROGRAM_ID, TOKEN_DECIMALS};
 
+/// Append each remaining account as an `InstructionAccount` meta, preserving its
+/// writable/signer flags. Shared by every compressed-token CPI builder — dedups
+/// the identical loop across the compress / transfer / burn paths.
+#[inline(always)]
+fn push_remaining_metas<'a>(metas: &mut Vec<InstructionAccount<'a>>, remaining: &'a [AccountView]) {
+    for acct in remaining {
+        let meta = match (acct.is_writable(), acct.is_signer()) {
+            (true, true) => InstructionAccount::writable_signer(acct.address()),
+            (true, false) => InstructionAccount::writable(acct.address()),
+            (false, true) => InstructionAccount::readonly_signer(acct.address()),
+            _ => InstructionAccount::readonly(acct.address()),
+        };
+        metas.push(meta);
+    }
+}
+
 // ── Discriminators ────────────────────────────────────────────────────────────
 /// Anchor 8-byte discriminator for `compress_spl_token_account` (Path A compress).
 ///
@@ -328,15 +344,7 @@ pub fn cpi_compress_from_spl<'a>(
     account_metas.push(InstructionAccount::writable(source_ata.address()));                    // [10]
     account_metas.push(InstructionAccount::readonly(token_program.address()));                 // [11]
     account_metas.push(InstructionAccount::readonly(system_program.address()));                // [12]
-    for acct in remaining_accounts {
-        let meta = match (acct.is_writable(), acct.is_signer()) {
-            (true, true)  => InstructionAccount::writable_signer(acct.address()),
-            (true, false) => InstructionAccount::writable(acct.address()),
-            (false, true) => InstructionAccount::readonly_signer(acct.address()),
-            _             => InstructionAccount::readonly(acct.address()),
-        };
-        account_metas.push(meta);
-    }
+    push_remaining_metas(&mut account_metas, remaining_accounts);
 
     let instruction = InstructionView {
         program_id: &prog_id,
@@ -426,15 +434,7 @@ pub fn cpi_decompress_to_spl<'a>(
     account_metas.push(InstructionAccount::writable(spl_interface_pda.address()));           // packed[3]
     account_metas.push(InstructionAccount::readonly(spl_token_program.address()));           // packed[4]
     account_metas.push(InstructionAccount::readonly(system_program.address()));              // packed[5]
-    for acct in remaining_accounts {
-        let meta = match (acct.is_writable(), acct.is_signer()) {
-            (true, true)  => InstructionAccount::writable_signer(acct.address()),
-            (true, false) => InstructionAccount::writable(acct.address()),
-            (false, true) => InstructionAccount::readonly_signer(acct.address()),
-            _             => InstructionAccount::readonly(acct.address()),
-        };
-        account_metas.push(meta);
-    }
+    push_remaining_metas(&mut account_metas, remaining_accounts);
 
     let instruction = InstructionView {
         program_id: &prog_id,
@@ -610,15 +610,7 @@ pub fn cpi_compressed_burn<'a>(
     account_metas.push(InstructionAccount::readonly_signer(authority.address())); // [2] authority (readonly_signer, deduped w/ [0])
     account_metas.push(InstructionAccount::readonly(system_program.address()));   // [3] system_program
     account_metas.push(InstructionAccount::writable_signer(payer.address()));     // [4] fee_payer
-    for acct in remaining_accounts {
-        let meta = match (acct.is_writable(), acct.is_signer()) {
-            (true, true)  => InstructionAccount::writable_signer(acct.address()),
-            (true, false) => InstructionAccount::writable(acct.address()),
-            (false, true) => InstructionAccount::readonly_signer(acct.address()),
-            _             => InstructionAccount::readonly(acct.address()),
-        };
-        account_metas.push(meta);
-    }
+    push_remaining_metas(&mut account_metas, remaining_accounts);
 
     let instruction = InstructionView {
         program_id: &prog_id,
