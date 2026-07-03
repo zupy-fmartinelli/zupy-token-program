@@ -32,24 +32,30 @@ pub fn cpi_transfer<'a>(
     Ok(())
 }
 
+/// Account set for a checked-transfer CPI (groups the four `AccountView` refs
+/// so `cpi_transfer_checked` stays under the parameter-count limit, S107).
+pub struct TransferCheckedAccounts<'a> {
+    pub source: &'a AccountView,
+    pub destination: &'a AccountView,
+    pub authority: &'a AccountView,
+    pub mint: &'a AccountView,
+}
+
 /// CPI: Token-2022 TransferChecked.
-/// Transfers `amount` tokens with decimal validation from `source` to `destination`.
+/// Transfers `amount` tokens with decimal validation from source to destination.
 #[inline(always)]
-pub fn cpi_transfer_checked<'a>(
-    source: &'a AccountView,
-    destination: &'a AccountView,
-    authority: &'a AccountView,
-    mint: &'a AccountView,
+pub fn cpi_transfer_checked(
+    accounts: &TransferCheckedAccounts,
     amount: u64,
     decimals: u8,
     token_program: &Address,
     signers: &[Signer],
 ) -> Result<(), ProgramError> {
     TransferChecked {
-        from: source,
-        mint,
-        to: destination,
-        authority,
+        from: accounts.source,
+        mint: accounts.mint,
+        to: accounts.destination,
+        authority: accounts.authority,
         amount,
         decimals,
         token_program,

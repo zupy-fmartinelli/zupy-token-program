@@ -403,11 +403,14 @@ fn setup_split_transfer() -> (Instruction, Vec<(Pubkey, Account)>) {
         &incentive_pool_pda, &dummy, &mint, bump, true, false,
     );
 
-    let total_amount: u64 = 1_000_000;
+    // Burn-free explicit-amount layout (AD-A1): company + pool legs.
+    let company_amount: u64 = 1_000_000;
+    let pool_amount: u64 = 0;
     let mut payload = Vec::new();
     payload.extend_from_slice(&user_id.to_le_bytes());
     payload.extend_from_slice(&company_id.to_le_bytes());
-    payload.extend_from_slice(&total_amount.to_le_bytes());
+    payload.extend_from_slice(&company_amount.to_le_bytes());
+    payload.extend_from_slice(&pool_amount.to_le_bytes());
     payload.push(user_bump);
     payload.push(company_bump);
     payload.push(incentive_bump);
@@ -1305,7 +1308,8 @@ fn test_cu_error_paths() {
         let mut payload = Vec::new();
         payload.extend_from_slice(&1u64.to_le_bytes()); // user_id
         payload.extend_from_slice(&2u64.to_le_bytes()); // company_id
-        payload.extend_from_slice(&0u64.to_le_bytes()); // zero amount
+        payload.extend_from_slice(&0u64.to_le_bytes()); // company_amount = 0 (ZeroAmount)
+        payload.extend_from_slice(&0u64.to_le_bytes()); // pool_amount = 0
         payload.push(user_bump);
         payload.push(company_bump);
         payload.push(incentive_bump);
@@ -1390,6 +1394,30 @@ fn test_binary_size() {
 // COMPREHENSIVE BENCHMARK REPORT
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Note string for a benchmark result (extracted from the `bench!` macro to keep
+/// `test_cu_benchmark_report` under the cognitive-complexity limit, S3776).
+fn bench_note(passed: bool, cu: u64, max: u64) -> String {
+    if !passed {
+        format!("EXCEEDED by {}", cu - max)
+    } else if cu as f64 > max as f64 * 0.8 {
+        "WARN: close to limit".into()
+    } else {
+        String::new()
+    }
+}
+
+/// Print one classification's benchmark rows (extracted from the 3 identical
+/// report loops, S3776).
+fn print_path(results: &[CuResult], class: &str) {
+    for r in results.iter().filter(|r| r.classification == class) {
+        let warn = if r.warn_close() && r.passed { " WARN" } else { "" };
+        println!(
+            "  {:30} | Anchor: ~{:>6} | Pinocchio: {:>6} | Savings: {:>5.1}% | [{}{}]",
+            r.name, r.anchor_est, r.pinocchio_cu, r.savings_pct(), r.status_str(), warn
+        );
+    }
+}
+
 #[test]
 fn test_cu_benchmark_report() {
     let mollusk = setup_mollusk();
@@ -1409,9 +1437,7 @@ fn test_cu_benchmark_report() {
                 pinocchio_cu: cu,
                 max_allowed: $max,
                 passed,
-                note: if !passed { format!("EXCEEDED by {}", cu - $max) }
-                      else if cu as f64 > $max as f64 * 0.8 { "WARN: close to limit".into() }
-                      else { String::new() },
+                note: bench_note(passed, cu, $max),
             });
         }};
     }
@@ -1747,31 +1773,13 @@ fn test_cu_benchmark_report() {
     println!();
 
     println!("HOT-PATH INSTRUCTIONS:");
-    for r in results.iter().filter(|r| r.classification == "Hot-path") {
-        let warn = if r.warn_close() && r.passed { " WARN" } else { "" };
-        println!(
-            "  {:30} | Anchor: ~{:>6} | Pinocchio: {:>6} | Savings: {:>5.1}% | [{}{}]",
-            r.name, r.anchor_est, r.pinocchio_cu, r.savings_pct(), r.status_str(), warn
-        );
-    }
+    print_path(&results, "Hot-path");
 
     println!("\nWARM-PATH INSTRUCTIONS:");
-    for r in results.iter().filter(|r| r.classification == "Warm-path") {
-        let warn = if r.warn_close() && r.passed { " WARN" } else { "" };
-        println!(
-            "  {:30} | Anchor: ~{:>6} | Pinocchio: {:>6} | Savings: {:>5.1}% | [{}{}]",
-            r.name, r.anchor_est, r.pinocchio_cu, r.savings_pct(), r.status_str(), warn
-        );
-    }
+    print_path(&results, "Warm-path");
 
     println!("\nCOLD-PATH INSTRUCTIONS:");
-    for r in results.iter().filter(|r| r.classification == "Cold-path") {
-        let warn = if r.warn_close() && r.passed { " WARN" } else { "" };
-        println!(
-            "  {:30} | Anchor: ~{:>6} | Pinocchio: {:>6} | Savings: {:>5.1}% | [{}{}]",
-            r.name, r.anchor_est, r.pinocchio_cu, r.savings_pct(), r.status_str(), warn
-        );
-    }
+    print_path(&results, "Cold-path");
 
     // Summary
     let hot_path: Vec<&CuResult> = results.iter().filter(|r| r.classification == "Hot-path" || r.classification == "Warm-path").collect();

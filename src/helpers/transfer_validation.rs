@@ -6,7 +6,7 @@ use pinocchio::error::ProgramError;
 
 use crate::constants::{TOKEN_2022_PROGRAM_ID, TOKEN_DECIMALS, TOKEN_STATE_SEED};
 use crate::error::ZupyTokenError;
-use crate::helpers::cpi::{cpi_create_ata_if_needed, cpi_transfer_checked};
+use crate::helpers::cpi::{cpi_create_ata_if_needed, cpi_transfer_checked, TransferCheckedAccounts};
 use crate::helpers::pda::validate_pda_with_seeds;
 use crate::state::token_state::{TokenState, TOKEN_STATE_SIZE};
 
@@ -336,24 +336,30 @@ pub fn validate_destination_ata_if_exists(
 /// 5. Destination ATA validation (if exists)
 /// 6. Create destination ATA if needed (CPI)
 /// 7. TransferChecked CPI with source PDA as signer
+/// Shared context accounts for a PDA-to-PDA transfer (groups 6 refs — S107).
+pub struct TransferCtx<'a> {
+    pub program_id: &'a Address,
+    pub transfer_authority: &'a AccountView,
+    pub token_state_account: &'a AccountView,
+    pub mint: &'a AccountView,
+    pub token_program: &'a AccountView,
+    pub system_program: &'a AccountView,
+}
+
+/// One side (source or destination) of a PDA-to-PDA transfer (groups 5 — S107).
+pub struct TransferEndpoint<'a> {
+    pub pda: &'a AccountView,
+    pub ata: &'a AccountView,
+    pub seed: &'a [u8],
+    pub id_bytes: &'a [u8],
+    pub bump: u8,
+}
+
 #[inline(always)]
 pub fn execute_pda_transfer(
-    program_id: &Address,
-    transfer_authority: &AccountView,
-    token_state_account: &AccountView,
-    mint: &AccountView,
-    token_program: &AccountView,
-    system_program: &AccountView,
-    source_pda: &AccountView,
-    source_ata: &AccountView,
-    source_seed: &[u8],
-    source_id_bytes: &[u8],
-    source_bump: u8,
-    dest_pda: &AccountView,
-    dest_ata: &AccountView,
-    dest_seed: &[u8],
-    dest_id_bytes: &[u8],
-    dest_bump: u8,
+    ctx: &TransferCtx,
+    source: &TransferEndpoint,
+    dest: &TransferEndpoint,
     amount: u64,
     memo: &str,
 ) -> ProgramResult {
@@ -365,66 +371,68 @@ pub fn execute_pda_transfer(
 
     // ── Common transfer validation (9 checks) ─────────────────────────
     validate_transfer_common(
-        program_id,
-        token_state_account,
-        transfer_authority,
-        mint,
-        token_program,
+        ctx.program_id,
+        ctx.token_state_account,
+        ctx.transfer_authority,
+        ctx.mint,
+        ctx.token_program,
     )?;
 
     // ── PDA validation: source ────────────────────────────────────────
     validate_pda_with_seeds(
-        source_pda.address(),
-        &[source_seed, source_id_bytes, &[source_bump]],
-        program_id,
+        source.pda.address(),
+        &[source.seed, source.id_bytes, &[source.bump]],
+        ctx.program_id,
     )?;
 
     // ── PDA validation: destination ───────────────────────────────────
     validate_pda_with_seeds(
-        dest_pda.address(),
-        &[dest_seed, dest_id_bytes, &[dest_bump]],
-        program_id,
+        dest.pda.address(),
+        &[dest.seed, dest.id_bytes, &[dest.bump]],
+        ctx.program_id,
     )?;
 
     // ── Source ATA validation ─────────────────────────────────────────
-    validate_source_ata(source_ata, mint.address(), source_pda.address())?;
+    validate_source_ata(source.ata, ctx.mint.address(), source.pda.address())?;
 
     // ── Balance check ─────────────────────────────────────────────────
-    let balance = read_token_balance(source_ata);
+    let balance = read_token_balance(source.ata);
     if balance < amount {
         return Err(ZupyTokenError::InsufficientBalance.into());
     }
 
     // ── Destination ATA validation (if already exists) ────────────────
-    validate_destination_ata_if_exists(dest_ata, mint.address())?;
+    validate_destination_ata_if_exists(dest.ata, ctx.mint.address())?;
 
     // ── CPI: Create destination ATA if needed ─────────────────────────
     cpi_create_ata_if_needed(
-        dest_ata,
-        transfer_authority,
-        dest_pda,
-        mint,
-        token_program,
-        system_program,
+        dest.ata,
+        ctx.transfer_authority,
+        dest.pda,
+        ctx.mint,
+        ctx.token_program,
+        ctx.system_program,
     )?;
 
     // ── CPI: TransferChecked (source PDA signs) ───────────────────────
-    let bump_bytes = [source_bump];
+    let bump_bytes = [source.bump];
     let signer_seeds: [Seed; 3] = [
-        Seed::from(source_seed),
-        Seed::from(source_id_bytes),
+        Seed::from(source.seed),
+        Seed::from(source.id_bytes),
         Seed::from(bump_bytes.as_ref()),
     ];
     let signer = Signer::from(&signer_seeds);
 
     cpi_transfer_checked(
-        source_ata,
-        dest_ata,
-        source_pda,
-        mint,
+        &TransferCheckedAccounts {
+            source: source.ata,
+            destination: dest.ata,
+            authority: source.pda,
+            mint: ctx.mint,
+        },
         amount,
         TOKEN_DECIMALS,
-        token_program.address(),
+        ctx.token_program.address(),
         &[signer],
     )?;
 
@@ -1492,15 +1500,30 @@ mod tests {
         let mut b8 = make_account_buf(d, d, false, false, 0).0;
 
         let result = execute_pda_transfer(
-            &pid,
-            &view_from_buf(&mut b0), &view_from_buf(&mut b1),
-            &view_from_buf(&mut b2), &view_from_buf(&mut b3),
-            &view_from_buf(&mut b4), &view_from_buf(&mut b5),
-            &view_from_buf(&mut b6),
-            USER_SEED, &1u64.to_le_bytes(), 255,
-            &view_from_buf(&mut b7), &view_from_buf(&mut b8),
-            COMPANY_SEED, &2u64.to_le_bytes(), 255,
-            0, "zupy:v1:transfer:123",
+            &TransferCtx {
+                program_id: &pid,
+                transfer_authority: &view_from_buf(&mut b0),
+                token_state_account: &view_from_buf(&mut b1),
+                mint: &view_from_buf(&mut b2),
+                token_program: &view_from_buf(&mut b3),
+                system_program: &view_from_buf(&mut b4),
+            },
+            &TransferEndpoint {
+                pda: &view_from_buf(&mut b5),
+                ata: &view_from_buf(&mut b6),
+                seed: USER_SEED,
+                id_bytes: &1u64.to_le_bytes(),
+                bump: 255,
+            },
+            &TransferEndpoint {
+                pda: &view_from_buf(&mut b7),
+                ata: &view_from_buf(&mut b8),
+                seed: COMPANY_SEED,
+                id_bytes: &2u64.to_le_bytes(),
+                bump: 255,
+            },
+            0,
+            "zupy:v1:transfer:123",
         );
         assert_eq!(result.unwrap_err(), ProgramError::Custom(ZupyTokenError::ZeroAmount as u32));
     }
@@ -1520,15 +1543,30 @@ mod tests {
         let mut b8 = make_account_buf(d, d, false, false, 0).0;
 
         let result = execute_pda_transfer(
-            &pid,
-            &view_from_buf(&mut b0), &view_from_buf(&mut b1),
-            &view_from_buf(&mut b2), &view_from_buf(&mut b3),
-            &view_from_buf(&mut b4), &view_from_buf(&mut b5),
-            &view_from_buf(&mut b6),
-            USER_SEED, &1u64.to_le_bytes(), 255,
-            &view_from_buf(&mut b7), &view_from_buf(&mut b8),
-            COMPANY_SEED, &2u64.to_le_bytes(), 255,
-            1_000_000, "bad-memo",
+            &TransferCtx {
+                program_id: &pid,
+                transfer_authority: &view_from_buf(&mut b0),
+                token_state_account: &view_from_buf(&mut b1),
+                mint: &view_from_buf(&mut b2),
+                token_program: &view_from_buf(&mut b3),
+                system_program: &view_from_buf(&mut b4),
+            },
+            &TransferEndpoint {
+                pda: &view_from_buf(&mut b5),
+                ata: &view_from_buf(&mut b6),
+                seed: USER_SEED,
+                id_bytes: &1u64.to_le_bytes(),
+                bump: 255,
+            },
+            &TransferEndpoint {
+                pda: &view_from_buf(&mut b7),
+                ata: &view_from_buf(&mut b8),
+                seed: COMPANY_SEED,
+                id_bytes: &2u64.to_le_bytes(),
+                bump: 255,
+            },
+            1_000_000,
+            "bad-memo",
         );
         assert_eq!(result.unwrap_err(), ProgramError::Custom(ZupyTokenError::InvalidMemoFormat as u32));
     }
@@ -1558,15 +1596,30 @@ mod tests {
         let mut b8 = make_account_buf(d, d, false, false, 0).0;
 
         let result = execute_pda_transfer(
-            &pid,
-            &view_from_buf(&mut auth_buf), &ts_view,
-            &view_from_buf(&mut mint_buf), &view_from_buf(&mut tp_buf),
-            &view_from_buf(&mut sys_buf), &view_from_buf(&mut b5),
-            &view_from_buf(&mut b6),
-            USER_SEED, &1u64.to_le_bytes(), 255,
-            &view_from_buf(&mut b7), &view_from_buf(&mut b8),
-            COMPANY_SEED, &2u64.to_le_bytes(), 255,
-            1_000_000, "zupy:v1:transfer:123",
+            &TransferCtx {
+                program_id: &pid,
+                transfer_authority: &view_from_buf(&mut auth_buf),
+                token_state_account: &ts_view,
+                mint: &view_from_buf(&mut mint_buf),
+                token_program: &view_from_buf(&mut tp_buf),
+                system_program: &view_from_buf(&mut sys_buf),
+            },
+            &TransferEndpoint {
+                pda: &view_from_buf(&mut b5),
+                ata: &view_from_buf(&mut b6),
+                seed: USER_SEED,
+                id_bytes: &1u64.to_le_bytes(),
+                bump: 255,
+            },
+            &TransferEndpoint {
+                pda: &view_from_buf(&mut b7),
+                ata: &view_from_buf(&mut b8),
+                seed: COMPANY_SEED,
+                id_bytes: &2u64.to_le_bytes(),
+                bump: 255,
+            },
+            1_000_000,
+            "zupy:v1:transfer:123",
         );
         assert_eq!(result.unwrap_err(), ProgramError::Custom(ZupyTokenError::InvalidAuthority as u32));
     }
@@ -1605,13 +1658,30 @@ mod tests {
         let mut dst_ata_buf = make_account_buf(d, d, false, false, 0).0;
 
         let result = execute_pda_transfer(
-            &pid,
-            &auth_view, &ts_view, &mint_view, &tp_view, &sys_view,
-            &src_pda_view, &view_from_buf(&mut src_ata_buf),
-            USER_SEED, &source_id_bytes, source_bump,
-            &view_from_buf(&mut dst_pda_buf), &view_from_buf(&mut dst_ata_buf),
-            COMPANY_SEED, &2u64.to_le_bytes(), 255,
-            1_000_000, "zupy:v1:transfer:123",
+            &TransferCtx {
+                program_id: &pid,
+                transfer_authority: &auth_view,
+                token_state_account: &ts_view,
+                mint: &mint_view,
+                token_program: &tp_view,
+                system_program: &sys_view,
+            },
+            &TransferEndpoint {
+                pda: &src_pda_view,
+                ata: &view_from_buf(&mut src_ata_buf),
+                seed: USER_SEED,
+                id_bytes: &source_id_bytes,
+                bump: source_bump,
+            },
+            &TransferEndpoint {
+                pda: &view_from_buf(&mut dst_pda_buf),
+                ata: &view_from_buf(&mut dst_ata_buf),
+                seed: COMPANY_SEED,
+                id_bytes: &2u64.to_le_bytes(),
+                bump: 255,
+            },
+            1_000_000,
+            "zupy:v1:transfer:123",
         );
         assert_eq!(result.unwrap_err(), ProgramError::Custom(ZupyTokenError::InvalidPDA as u32));
     }
@@ -1657,13 +1727,30 @@ mod tests {
         let mut dst_ata_buf = make_account_buf(d, d, false, false, 0).0;
 
         let result = execute_pda_transfer(
-            &pid,
-            &auth_view, &ts_view, &mint_view, &tp_view, &sys_view,
-            &src_pda_view, &view_from_buf(&mut src_ata_buf),
-            USER_SEED, &source_id_bytes, source_bump,
-            &dst_pda_view, &view_from_buf(&mut dst_ata_buf),
-            COMPANY_SEED, &dest_id_bytes, dest_bump,
-            1_000_000, "zupy:v1:transfer:123",
+            &TransferCtx {
+                program_id: &pid,
+                transfer_authority: &auth_view,
+                token_state_account: &ts_view,
+                mint: &mint_view,
+                token_program: &tp_view,
+                system_program: &sys_view,
+            },
+            &TransferEndpoint {
+                pda: &src_pda_view,
+                ata: &view_from_buf(&mut src_ata_buf),
+                seed: USER_SEED,
+                id_bytes: &source_id_bytes,
+                bump: source_bump,
+            },
+            &TransferEndpoint {
+                pda: &dst_pda_view,
+                ata: &view_from_buf(&mut dst_ata_buf),
+                seed: COMPANY_SEED,
+                id_bytes: &dest_id_bytes,
+                bump: dest_bump,
+            },
+            1_000_000,
+            "zupy:v1:transfer:123",
         );
         assert_eq!(result.unwrap_err(), ProgramError::Custom(ZupyTokenError::InvalidPDA as u32));
     }
@@ -1714,13 +1801,30 @@ mod tests {
         let mut dst_ata_buf = make_account_buf(d, d, false, false, 0).0;
 
         let result = execute_pda_transfer(
-            &pid,
-            &auth_view, &ts_view, &mint_view, &tp_view, &sys_view,
-            &src_pda_view, &src_ata_view,
-            USER_SEED, &source_id_bytes, source_bump,
-            &dst_pda_view, &view_from_buf(&mut dst_ata_buf),
-            COMPANY_SEED, &dest_id_bytes, dest_bump,
-            1_000_000, "zupy:v1:transfer:123",
+            &TransferCtx {
+                program_id: &pid,
+                transfer_authority: &auth_view,
+                token_state_account: &ts_view,
+                mint: &mint_view,
+                token_program: &tp_view,
+                system_program: &sys_view,
+            },
+            &TransferEndpoint {
+                pda: &src_pda_view,
+                ata: &src_ata_view,
+                seed: USER_SEED,
+                id_bytes: &source_id_bytes,
+                bump: source_bump,
+            },
+            &TransferEndpoint {
+                pda: &dst_pda_view,
+                ata: &view_from_buf(&mut dst_ata_buf),
+                seed: COMPANY_SEED,
+                id_bytes: &dest_id_bytes,
+                bump: dest_bump,
+            },
+            1_000_000,
+            "zupy:v1:transfer:123",
         );
         assert_eq!(result.unwrap_err(), ProgramError::Custom(ZupyTokenError::InvalidMint as u32));
     }
@@ -1773,13 +1877,30 @@ mod tests {
         let mut dst_ata_buf = make_account_buf(d, d, false, false, 0).0;
 
         let result = execute_pda_transfer(
-            &pid,
-            &auth_view, &ts_view, &mint_view, &tp_view, &sys_view,
-            &src_pda_view, &src_ata_view,
-            USER_SEED, &source_id_bytes, source_bump,
-            &dst_pda_view, &view_from_buf(&mut dst_ata_buf),
-            COMPANY_SEED, &dest_id_bytes, dest_bump,
-            1_000_000, "zupy:v1:transfer:123",
+            &TransferCtx {
+                program_id: &pid,
+                transfer_authority: &auth_view,
+                token_state_account: &ts_view,
+                mint: &mint_view,
+                token_program: &tp_view,
+                system_program: &sys_view,
+            },
+            &TransferEndpoint {
+                pda: &src_pda_view,
+                ata: &src_ata_view,
+                seed: USER_SEED,
+                id_bytes: &source_id_bytes,
+                bump: source_bump,
+            },
+            &TransferEndpoint {
+                pda: &dst_pda_view,
+                ata: &view_from_buf(&mut dst_ata_buf),
+                seed: COMPANY_SEED,
+                id_bytes: &dest_id_bytes,
+                bump: dest_bump,
+            },
+            1_000_000,
+            "zupy:v1:transfer:123",
         );
         assert_eq!(result.unwrap_err(), ProgramError::Custom(ZupyTokenError::InsufficientBalance as u32));
     }
@@ -1835,13 +1956,30 @@ mod tests {
         let dst_ata_view = view_from_buf(&mut dst_ata_buf);
 
         let result = execute_pda_transfer(
-            &pid,
-            &auth_view, &ts_view, &mint_view, &tp_view, &sys_view,
-            &src_pda_view, &src_ata_view,
-            USER_SEED, &source_id_bytes, source_bump,
-            &dst_pda_view, &dst_ata_view,
-            COMPANY_SEED, &dest_id_bytes, dest_bump,
-            1_000_000, "zupy:v1:transfer:123",
+            &TransferCtx {
+                program_id: &pid,
+                transfer_authority: &auth_view,
+                token_state_account: &ts_view,
+                mint: &mint_view,
+                token_program: &tp_view,
+                system_program: &sys_view,
+            },
+            &TransferEndpoint {
+                pda: &src_pda_view,
+                ata: &src_ata_view,
+                seed: USER_SEED,
+                id_bytes: &source_id_bytes,
+                bump: source_bump,
+            },
+            &TransferEndpoint {
+                pda: &dst_pda_view,
+                ata: &dst_ata_view,
+                seed: COMPANY_SEED,
+                id_bytes: &dest_id_bytes,
+                bump: dest_bump,
+            },
+            1_000_000,
+            "zupy:v1:transfer:123",
         );
         assert_eq!(result.unwrap_err(), ProgramError::Custom(ZupyTokenError::InvalidMint as u32));
     }
