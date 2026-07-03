@@ -10,7 +10,7 @@
 
 use pinocchio::cpi::{Seed, Signer};
 use pinocchio::error::ProgramError;
-use pinocchio::instruction::{InstructionAccount, InstructionView};
+use pinocchio::instruction::InstructionView;
 use pinocchio::{AccountView, Address, ProgramResult};
 
 use crate::constants::{
@@ -18,11 +18,12 @@ use crate::constants::{
 };
 use crate::error::ZupyTokenError;
 use crate::helpers::compressed_accounts::{
-    cpi_decompress_to_spl, derive_spl_interface_pda, validate_v1_transfer_disc,
+    build_metas_forcing_signer, cpi_decompress_to_spl, derive_spl_interface_pda,
+    validate_v1_transfer_disc,
 };
 use crate::helpers::instruction_data::{parse_string, parse_u64, parse_u8};
 use crate::helpers::memo::validate_memo_format;
-use crate::helpers::pda::{validate_pda, validate_pda_with_seeds};
+use crate::helpers::pda::{validate_id_pda, validate_pda};
 use crate::helpers::transfer_validation::validate_transfer_common;
 use crate::state::token_state::TokenState;
 
@@ -43,6 +44,32 @@ use crate::state::token_state::TokenState;
 ///   11+ Light system accounts
 ///
 /// Data: entity_id (0-7) + amount (8-15) + entity_bump (16) + memo (17+)
+/// Validate the entity PDA (client bump) + the pool ATA (address matches
+/// token_state, owned by Token-2022). Shared by the decompress + V1-passthrough
+/// return-to-pool paths (dedup).
+#[inline(always)]
+fn validate_entity_pda_and_pool_ata(
+    program_id: &Address,
+    entity_pda: &AccountView,
+    pda_seed: &[u8],
+    entity_id_u64: u64,
+    entity_bump: u8,
+    token_state_account: &AccountView,
+    pool_ata: &AccountView,
+) -> Result<(), ProgramError> {
+    validate_id_pda(entity_pda.address(), pda_seed, entity_id_u64, entity_bump, program_id)?;
+
+    let state = TokenState::from_slice(unsafe { token_state_account.borrow_unchecked() });
+    if pool_ata.address().as_ref() != state.pool_ata() {
+        return Err(ZupyTokenError::InvalidPoolAccount.into());
+    }
+    let token_2022_addr = Address::from(TOKEN_2022_PROGRAM_ID);
+    if !pool_ata.owned_by(&token_2022_addr) {
+        return Err(ZupyTokenError::InvalidPoolAccount.into());
+    }
+    Ok(())
+}
+
 pub fn decompress_to_pool(
     program_id: &Address,
     accounts: &[AccountView],
@@ -103,23 +130,16 @@ pub fn decompress_to_pool(
         return Err(ProgramError::IncorrectProgramId);
     }
 
-    // ── PDA validation (via client-provided bump) ─────────────────────────
-    let entity_id_bytes = entity_id_u64.to_le_bytes();
-    validate_pda_with_seeds(
-        entity_pda.address(),
-        &[pda_seed, &entity_id_bytes, &[entity_bump]],
+    // ── Entity PDA + pool ATA validation ─────────────────────────────
+    validate_entity_pda_and_pool_ata(
         program_id,
+        entity_pda,
+        pda_seed,
+        entity_id_u64,
+        entity_bump,
+        token_state_account,
+        pool_ata,
     )?;
-
-    // ── Pool ATA validation ─────────────────────────────────────────────
-    let state = TokenState::from_slice(unsafe { token_state_account.borrow_unchecked() });
-    if pool_ata.address().as_ref() != state.pool_ata() {
-        return Err(ZupyTokenError::InvalidPoolAccount.into());
-    }
-    let token_2022_addr = Address::from(TOKEN_2022_PROGRAM_ID);
-    if !pool_ata.owned_by(&token_2022_addr) {
-        return Err(ZupyTokenError::InvalidPoolAccount.into());
-    }
 
     // ── Validate spl_interface_pda address and derive bump ───────────────
     let mint_key: [u8; 32] = mint
@@ -131,6 +151,7 @@ pub fn decompress_to_pool(
     validate_pda(spl_interface_pda.address(), &expected_spl_pda)?;
 
     // ── CPI: Decompress entity compressed balance → pool ATA ────────────
+    let entity_id_bytes = entity_id_u64.to_le_bytes();
     let bump_bytes = [entity_bump];
     let signer_seeds: [Seed; 3] = [
         Seed::from(pda_seed),
@@ -211,40 +232,23 @@ pub fn v1_passthrough_to_pool(
         token_program,
     )?;
 
-    // ── PDA validation (via client-provided bump) ────────────────────────
-    let entity_id_bytes = entity_id_u64.to_le_bytes();
-    validate_pda_with_seeds(
-        entity_pda.address(),
-        &[pda_seed, &entity_id_bytes, &[entity_bump]],
+    // ── Entity PDA + pool ATA validation ─────────────────────────────
+    validate_entity_pda_and_pool_ata(
         program_id,
+        entity_pda,
+        pda_seed,
+        entity_id_u64,
+        entity_bump,
+        token_state_account,
+        pool_ata,
     )?;
-
-    // ── Pool ATA validation ───────────────────────────────────────────────
-    let state = TokenState::from_slice(unsafe { token_state_account.borrow_unchecked() });
-    if pool_ata.address().as_ref() != state.pool_ata() {
-        return Err(ZupyTokenError::InvalidPoolAccount.into());
-    }
-    let token_2022_addr = Address::from(TOKEN_2022_PROGRAM_ID);
-    if !pool_ata.owned_by(&token_2022_addr) {
-        return Err(ZupyTokenError::InvalidPoolAccount.into());
-    }
 
     // ── Build CPI instruction for cToken V1 ───────────────────────────────
     let prog_id: Address = LIGHT_COMPRESSED_TOKEN_PROGRAM_ID.into();
     let cpi_accounts = &accounts[6..];
 
     // Build account metas, forcing entity_pda to be signer for invoke_signed.
-    let mut account_metas = Vec::with_capacity(cpi_accounts.len());
-    for acct in cpi_accounts {
-        let is_entity_pda = acct.address() == entity_pda.address();
-        let meta = match (acct.is_writable(), acct.is_signer() || is_entity_pda) {
-            (true, true) => InstructionAccount::writable_signer(acct.address()),
-            (true, false) => InstructionAccount::writable(acct.address()),
-            (false, true) => InstructionAccount::readonly_signer(acct.address()),
-            _ => InstructionAccount::readonly(acct.address()),
-        };
-        account_metas.push(meta);
-    }
+    let account_metas = build_metas_forcing_signer(cpi_accounts, entity_pda);
 
     let instruction = InstructionView {
         program_id: &prog_id,
@@ -255,6 +259,7 @@ pub fn v1_passthrough_to_pool(
     let account_views: Vec<&AccountView> = cpi_accounts.iter().collect();
 
     // ── CPI: Forward V1 TRANSFER to cToken, signing with entity PDA ──────
+    let entity_id_bytes = entity_id_u64.to_le_bytes();
     let bump_bytes = [entity_bump];
     let signer_seeds: [Seed; 3] = [
         Seed::from(pda_seed),

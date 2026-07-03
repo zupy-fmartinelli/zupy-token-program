@@ -2,11 +2,11 @@ use pinocchio::cpi::{Seed, Signer};
 use pinocchio::{AccountView, Address, ProgramResult};
 use pinocchio::error::ProgramError;
 
-use crate::constants::{COMPANY_SEED, INCENTIVE_POOL_SEED, LIGHT_COMPRESSED_TOKEN_PROGRAM_ID, USER_SEED};
+use crate::constants::{COMPANY_SEED, INCENTIVE_POOL_SEED, USER_SEED};
 use crate::error::ZupyTokenError;
 use crate::helpers::compressed_accounts::cpi_compressed_transfer;
 use crate::helpers::instruction_data::{parse_string, parse_u64, parse_u8};
-use crate::helpers::pda::validate_pda_with_seeds;
+use crate::helpers::pda::{validate_light_ctoken_program, validate_id_pda, validate_pda_with_seeds};
 use crate::helpers::transfer_validation::validate_transfer_common_compressed;
 use crate::instructions::split_math::checked_total;
 
@@ -87,28 +87,12 @@ pub fn process(
     )?;
 
     // ── Check 9: compressed_token_program is Light cToken program ────────
-    let light_ctoken_addr = Address::from(LIGHT_COMPRESSED_TOKEN_PROGRAM_ID);
-    if compressed_token_program.address() != &light_ctoken_addr {
-        return Err(ZupyTokenError::InvalidTokenProgram.into());
-    }
+    validate_light_ctoken_program(compressed_token_program)?;
 
-    // ── PDA validation: user_pda (source) ───────────────────────────────
+    // ── PDA validation: user (source), company + incentive pool (dests) ──
     let user_id_bytes = user_id_u64.to_le_bytes();
-    validate_pda_with_seeds(
-        user_pda.address(),
-        &[USER_SEED, &user_id_bytes, &[user_bump]],
-        program_id,
-    )?;
-
-    // ── PDA validation: company_pda (destination 1) ─────────────────────
-    let company_id_bytes = company_id_u64.to_le_bytes();
-    validate_pda_with_seeds(
-        company_pda.address(),
-        &[COMPANY_SEED, &company_id_bytes, &[company_bump]],
-        program_id,
-    )?;
-
-    // ── PDA validation: incentive_pool_pda (destination 2) ──────────────
+    validate_id_pda(user_pda.address(), USER_SEED, user_id_u64, user_bump, program_id)?;
+    validate_id_pda(company_pda.address(), COMPANY_SEED, company_id_u64, company_bump, program_id)?;
     validate_pda_with_seeds(
         incentive_pool_pda.address(),
         &[INCENTIVE_POOL_SEED, &[incentive_bump]],

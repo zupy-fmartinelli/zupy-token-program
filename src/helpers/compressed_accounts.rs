@@ -85,6 +85,29 @@ fn push_remaining_metas<'a>(metas: &mut Vec<InstructionAccount<'a>>, remaining: 
     }
 }
 
+/// Build instruction-account metas from CPI accounts, forcing `forced_signer` to
+/// be a signer (needed for `invoke_signed`, where our program signs for a PDA
+/// that is not a signer on the outer tx). Dedups the identical loop in the V1
+/// passthrough transfer + return-to-pool paths.
+#[inline(always)]
+pub fn build_metas_forcing_signer<'a>(
+    cpi_accounts: &'a [AccountView],
+    forced_signer: &AccountView,
+) -> Vec<InstructionAccount<'a>> {
+    let mut metas = Vec::with_capacity(cpi_accounts.len());
+    for acct in cpi_accounts {
+        let force = acct.address() == forced_signer.address();
+        let meta = match (acct.is_writable(), acct.is_signer() || force) {
+            (true, true) => InstructionAccount::writable_signer(acct.address()),
+            (true, false) => InstructionAccount::writable(acct.address()),
+            (false, true) => InstructionAccount::readonly_signer(acct.address()),
+            _ => InstructionAccount::readonly(acct.address()),
+        };
+        metas.push(meta);
+    }
+    metas
+}
+
 // ── Discriminators ────────────────────────────────────────────────────────────
 /// Anchor 8-byte discriminator for `compress_spl_token_account` (Path A compress).
 ///

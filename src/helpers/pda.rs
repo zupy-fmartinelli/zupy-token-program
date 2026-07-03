@@ -1,10 +1,11 @@
+use pinocchio::AccountView;
 use pinocchio::Address;
 use pinocchio::error::ProgramError;
 
 use crate::constants::{
     COMPANY_SEED, COUPON_SEED, DISTRIBUTION_POOL_SEED, INCENTIVE_POOL_SEED,
-    RATE_LIMIT_SEED, TOKEN_STATE_SEED, USER_PDA_SEED, USER_SEED, ZUPY_CARD_MINT_SEED,
-    ZUPY_CARD_SEED,
+    LIGHT_COMPRESSED_TOKEN_PROGRAM_ID, RATE_LIMIT_SEED, TOKEN_STATE_SEED, USER_PDA_SEED,
+    USER_SEED, ZUPY_CARD_MINT_SEED, ZUPY_CARD_SEED,
 };
 use crate::error::ZupyTokenError;
 
@@ -96,6 +97,31 @@ pub fn validate_pda_with_seeds(
         .map_err(|_| ZupyTokenError::InvalidPDA)?;
     if account_key != &expected {
         return Err(ZupyTokenError::InvalidPDA.into());
+    }
+    Ok(())
+}
+
+/// Validate a `[seed, id_le_bytes, bump]` PDA in one call — dedups the
+/// `to_le_bytes()` + seed-array boilerplate repeated across instructions.
+#[inline(always)]
+pub fn validate_id_pda(
+    account_key: &Address,
+    seed: &[u8],
+    id_u64: u64,
+    bump: u8,
+    program_id: &Address,
+) -> Result<(), ProgramError> {
+    let id_bytes = id_u64.to_le_bytes();
+    validate_pda_with_seeds(account_key, &[seed, &id_bytes, &[bump]], program_id)
+}
+
+/// Verify the compressed-token program account is the canonical Light cToken
+/// program (check 9) — dedups the identical check across compressed instructions.
+#[inline(always)]
+pub fn validate_light_ctoken_program(compressed_token_program: &AccountView) -> Result<(), ProgramError> {
+    let light_ctoken_addr = Address::from(LIGHT_COMPRESSED_TOKEN_PROGRAM_ID);
+    if compressed_token_program.address() != &light_ctoken_addr {
+        return Err(ZupyTokenError::InvalidTokenProgram.into());
     }
     Ok(())
 }

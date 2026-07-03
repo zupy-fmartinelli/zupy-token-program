@@ -1,10 +1,10 @@
 use pinocchio::cpi::{Seed, Signer};
 use pinocchio::{AccountView, Address, ProgramResult};
 use pinocchio::error::ProgramError;
-use pinocchio::instruction::{InstructionAccount, InstructionView};
+use pinocchio::instruction::InstructionView;
 
 use crate::constants::{COMPANY_SEED, LIGHT_COMPRESSED_TOKEN_PROGRAM_ID, USER_SEED};
-use crate::helpers::compressed_accounts::validate_v1_transfer_disc;
+use crate::helpers::compressed_accounts::{build_metas_forcing_signer, validate_v1_transfer_disc};
 use crate::helpers::instruction_data::{parse_u64, parse_u8};
 use crate::helpers::pda::validate_pda_with_seeds;
 use crate::helpers::transfer_validation::validate_transfer_common_compressed;
@@ -112,17 +112,7 @@ pub fn process(
     // The company_pda is not a signer on the outer transaction (only our program
     // can sign for it), but it must be a signer in the CPI to the cToken program.
     // invoke_signed provides this signature via the company PDA seeds.
-    let mut account_metas = Vec::with_capacity(cpi_accounts.len());
-    for acct in cpi_accounts {
-        let is_company_pda = acct.address() == company_pda.address();
-        let meta = match (acct.is_writable(), acct.is_signer() || is_company_pda) {
-            (true, true)  => InstructionAccount::writable_signer(acct.address()),
-            (true, false) => InstructionAccount::writable(acct.address()),
-            (false, true) => InstructionAccount::readonly_signer(acct.address()),
-            _             => InstructionAccount::readonly(acct.address()),
-        };
-        account_metas.push(meta);
-    }
+    let account_metas = build_metas_forcing_signer(cpi_accounts, company_pda);
 
     let instruction = InstructionView {
         program_id: &prog_id,
