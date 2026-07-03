@@ -1418,6 +1418,86 @@ fn print_path(results: &[CuResult], class: &str) {
     }
 }
 
+/// Account for the initialize_token cold-path benchmark by meta index
+/// (extracted from the inline closure to keep the report test under S3776).
+fn acc_init_token(i: usize) -> Account {
+    if i == 5 || i == 6 || i == 7 {
+        Account { lamports: 1, data: vec![], owner: Pubkey::default(), executable: true, rent_epoch: 0 }
+    } else {
+        make_system_account(100_000_000)
+    }
+}
+
+/// Average savings for a slice of results (0 for empty — extracted, S3776).
+fn avg_savings(items: &[&CuResult]) -> f64 {
+    if items.is_empty() {
+        0.0
+    } else {
+        items.iter().map(|r| r.savings_pct()).sum::<f64>() / items.len() as f64
+    }
+}
+
+/// Average Pinocchio CU for a slice of results (extracted, S3776).
+fn avg_cu(items: &[&CuResult]) -> f64 {
+    items.iter().map(|r| r.pinocchio_cu as f64).sum::<f64>() / items.len().max(1) as f64
+}
+
+/// Print the full benchmark report; returns (all_passed, failed_count).
+/// Extracted from `test_cu_benchmark_report` to keep it under the S3776 limit.
+fn print_report(results: &[CuResult], binary_size: u64) -> (bool, usize) {
+    let binary_kb = binary_size as f64 / 1024.0;
+    let deploy_cost = binary_kb * 0.00482;
+
+    println!("\n=== ZUPY-PINOCCHIO CU BENCHMARK REPORT ===");
+    println!("Binary: {} bytes ({:.1} KB) — Deploy cost: ~{:.2} SOL", binary_size, binary_kb, deploy_cost);
+    println!("Measurement: Validation-path CU (up to CPI boundary, Token-2022 not loaded)");
+    println!();
+
+    println!("HOT-PATH INSTRUCTIONS:");
+    print_path(results, "Hot-path");
+    println!("\nWARM-PATH INSTRUCTIONS:");
+    print_path(results, "Warm-path");
+    println!("\nCOLD-PATH INSTRUCTIONS:");
+    print_path(results, "Cold-path");
+
+    let hot_path: Vec<&CuResult> = results
+        .iter()
+        .filter(|r| r.classification == "Hot-path" || r.classification == "Warm-path")
+        .collect();
+    let cold_path: Vec<&CuResult> = results.iter().filter(|r| r.classification == "Cold-path").collect();
+
+    let anchor_binary: u64 = 564_496;
+    let binary_savings = (1.0 - (binary_size as f64 / anchor_binary as f64)) * 100.0;
+    let anchor_deploy = anchor_binary as f64 / 1024.0 * 0.00482;
+
+    let all_passed = results.iter().all(|r| r.passed);
+    let failed_count = results.iter().filter(|r| !r.passed).count();
+
+    println!("\nSUMMARY:");
+    println!("  Hot/Warm-path avg savings: {:.1}%", avg_savings(&hot_path));
+    println!("  Cold-path avg savings: {:.1}%", avg_savings(&cold_path));
+    println!("  Hot-path avg CU: {:.0}", avg_cu(&hot_path));
+    println!("  Binary savings: {:.1}% ({} KB -> {:.1} KB)", binary_savings, anchor_binary / 1024, binary_kb);
+    println!("  Deploy cost savings: {:.1}% ({:.2} SOL -> {:.2} SOL)", (1.0 - deploy_cost / anchor_deploy) * 100.0, anchor_deploy, deploy_cost);
+    println!("  Total: {}/{} benchmarks passed", results.len() - failed_count, results.len());
+
+    print_failed(results, all_passed);
+    println!("=== END BENCHMARK REPORT ===\n");
+    (all_passed, failed_count)
+}
+
+/// Print the failed-instruction list (extracted so the branch+loop leave the
+/// report body, S3776).
+fn print_failed(results: &[CuResult], all_passed: bool) {
+    if all_passed {
+        return;
+    }
+    println!("\n  FAILED INSTRUCTIONS:");
+    for r in results.iter().filter(|r| !r.passed) {
+        println!("    {} — CU: {} (max: {}, exceeded by {})", r.name, r.pinocchio_cu, r.max_allowed, r.pinocchio_cu - r.max_allowed);
+    }
+}
+
 #[test]
 fn test_cu_benchmark_report() {
     let mollusk = setup_mollusk();
@@ -1471,14 +1551,8 @@ fn test_cu_benchmark_report() {
             AccountMeta::new_readonly(token_2022_id(), false),
             AccountMeta::new_readonly(ata_program_id(), false),
         ];
-        let accounts: Vec<(Pubkey, Account)> = metas.iter().enumerate().map(|(i, meta)| {
-            let acc = if i == 5 || i == 6 || i == 7 {
-                Account { lamports: 1, data: vec![], owner: Pubkey::default(), executable: true, rent_epoch: 0 }
-            } else {
-                make_system_account(100_000_000)
-            };
-            (meta.pubkey, acc)
-        }).collect();
+        let accounts: Vec<(Pubkey, Account)> =
+            metas.iter().enumerate().map(|(i, meta)| (meta.pubkey, acc_init_token(i))).collect();
         let ix = Instruction::new_with_bytes(program_id(), &data, metas);
         let r = run_benchmark(&mollusk, &ix, &accounts);
         results.push(CuResult {
@@ -1764,57 +1838,7 @@ fn test_cu_benchmark_report() {
     let binary_path = std::env::var("SBF_OUT_DIR").unwrap_or_else(|_| "target/deploy".to_string());
     let so_path = format!("{}/zupy_token_program.so", binary_path);
     let binary_size = std::fs::metadata(&so_path).map(|m| m.len()).unwrap_or(0);
-    let binary_kb = binary_size as f64 / 1024.0;
-    let deploy_cost = binary_kb * 0.00482;
-
-    println!("\n=== ZUPY-PINOCCHIO CU BENCHMARK REPORT ===");
-    println!("Binary: {} bytes ({:.1} KB) — Deploy cost: ~{:.2} SOL", binary_size, binary_kb, deploy_cost);
-    println!("Measurement: Validation-path CU (up to CPI boundary, Token-2022 not loaded)");
-    println!();
-
-    println!("HOT-PATH INSTRUCTIONS:");
-    print_path(&results, "Hot-path");
-
-    println!("\nWARM-PATH INSTRUCTIONS:");
-    print_path(&results, "Warm-path");
-
-    println!("\nCOLD-PATH INSTRUCTIONS:");
-    print_path(&results, "Cold-path");
-
-    // Summary
-    let hot_path: Vec<&CuResult> = results.iter().filter(|r| r.classification == "Hot-path" || r.classification == "Warm-path").collect();
-    let cold_path: Vec<&CuResult> = results.iter().filter(|r| r.classification == "Cold-path").collect();
-
-    let hot_avg_savings = if hot_path.is_empty() { 0.0 } else {
-        hot_path.iter().map(|r| r.savings_pct()).sum::<f64>() / hot_path.len() as f64
-    };
-    let cold_avg_savings = if cold_path.is_empty() { 0.0 } else {
-        cold_path.iter().map(|r| r.savings_pct()).sum::<f64>() / cold_path.len() as f64
-    };
-
-    let anchor_binary: u64 = 564_496;
-    let binary_savings = (1.0 - (binary_size as f64 / anchor_binary as f64)) * 100.0;
-    let anchor_deploy = anchor_binary as f64 / 1024.0 * 0.00482;
-
-    let all_passed = results.iter().all(|r| r.passed);
-    let failed_count = results.iter().filter(|r| !r.passed).count();
-
-    println!("\nSUMMARY:");
-    println!("  Hot/Warm-path avg savings: {:.1}%", hot_avg_savings);
-    println!("  Cold-path avg savings: {:.1}%", cold_avg_savings);
-    println!("  Hot-path avg CU: {:.0}", hot_path.iter().map(|r| r.pinocchio_cu as f64).sum::<f64>() / hot_path.len().max(1) as f64);
-    println!("  Binary savings: {:.1}% ({} KB -> {:.1} KB)", binary_savings, anchor_binary / 1024, binary_kb);
-    println!("  Deploy cost savings: {:.1}% ({:.2} SOL -> {:.2} SOL)", (1.0 - deploy_cost / anchor_deploy) * 100.0, anchor_deploy, deploy_cost);
-    println!("  Total: {}/{} benchmarks passed", results.len() - failed_count, results.len());
-
-    if !all_passed {
-        println!("\n  FAILED INSTRUCTIONS:");
-        for r in results.iter().filter(|r| !r.passed) {
-            println!("    {} — CU: {} (max: {}, exceeded by {})", r.name, r.pinocchio_cu, r.max_allowed, r.pinocchio_cu - r.max_allowed);
-        }
-    }
-
-    println!("=== END BENCHMARK REPORT ===\n");
+    let (all_passed, failed_count) = print_report(&results, binary_size);
 
     // Final assertion: all benchmarks must pass
     assert!(
