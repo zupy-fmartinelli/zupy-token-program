@@ -98,14 +98,16 @@ mod execute_split_transfer {
     }
 
     fn build_payload(
-        user_id: u64, company_id: u64, z_total: u64,
+        user_id: u64, company_id: u64, company_amount: u64, pool_amount: u64,
         user_bump: u8, company_bump: u8, incentive_bump: u8,
         op_type: &str,
     ) -> Vec<u8> {
+        // Burn-free explicit-amount layout (AD-A1): two u64 legs replace z_total.
         let mut payload = Vec::new();
         payload.extend_from_slice(&user_id.to_le_bytes());
         payload.extend_from_slice(&company_id.to_le_bytes());
-        payload.extend_from_slice(&z_total.to_le_bytes());
+        payload.extend_from_slice(&company_amount.to_le_bytes());
+        payload.extend_from_slice(&pool_amount.to_le_bytes());
         payload.push(user_bump);
         payload.push(company_bump);
         payload.push(incentive_bump);
@@ -153,7 +155,7 @@ mod execute_split_transfer {
     #[test]
     fn test_not_enough_accounts() {
         let mollusk = setup_mollusk();
-        let payload = build_payload(42, 99, 1_000_000, 0, 0, 0, "mixed_payment");
+        let payload = build_payload(42, 99, 1_000_000, 0, 0, 0, 0, "mixed_payment");
         let data = build_ix_data(&DISC_EXECUTE_SPLIT_TRANSFER, &payload);
 
         let instruction = Instruction::new_with_bytes(program_id(), &data, vec![
@@ -178,7 +180,7 @@ mod execute_split_transfer {
             &s.incentive_pool_pda, s.bump, true, false,
         );
 
-        let payload = build_payload(s.user_id, s.company_id, 0, s.user_bump, s.company_bump, s.incentive_bump, "mixed_payment");
+        let payload = build_payload(s.user_id, s.company_id, 0, 0, s.user_bump, s.company_bump, s.incentive_bump, "mixed_payment");
         let data = build_ix_data(&DISC_EXECUTE_SPLIT_TRANSFER, &payload);
         let metas = build_ix_metas(
             &s.transfer_auth, &s.token_state_pda, &s.mint,
@@ -204,7 +206,7 @@ mod execute_split_transfer {
             &s.incentive_pool_pda, s.bump, true, false,
         );
 
-        let payload = build_payload(s.user_id, s.company_id, 1_000_000, s.user_bump, s.company_bump, s.incentive_bump, "invalid_type");
+        let payload = build_payload(s.user_id, s.company_id, 1_000_000, 0, s.user_bump, s.company_bump, s.incentive_bump, "invalid_type");
         let data = build_ix_data(&DISC_EXECUTE_SPLIT_TRANSFER, &payload);
         let metas = build_ix_metas(
             &s.transfer_auth, &s.token_state_pda, &s.mint,
@@ -230,7 +232,7 @@ mod execute_split_transfer {
             &s.incentive_pool_pda, s.bump, false, false, // NOT initialized
         );
 
-        let payload = build_payload(s.user_id, s.company_id, 1_000_000, s.user_bump, s.company_bump, s.incentive_bump, "mixed_payment");
+        let payload = build_payload(s.user_id, s.company_id, 1_000_000, 0, s.user_bump, s.company_bump, s.incentive_bump, "mixed_payment");
         let data = build_ix_data(&DISC_EXECUTE_SPLIT_TRANSFER, &payload);
         let metas = build_ix_metas(
             &s.transfer_auth, &s.token_state_pda, &s.mint,
@@ -256,7 +258,7 @@ mod execute_split_transfer {
             &s.incentive_pool_pda, s.bump, true, true, // PAUSED
         );
 
-        let payload = build_payload(s.user_id, s.company_id, 1_000_000, s.user_bump, s.company_bump, s.incentive_bump, "mixed_payment");
+        let payload = build_payload(s.user_id, s.company_id, 1_000_000, 0, s.user_bump, s.company_bump, s.incentive_bump, "mixed_payment");
         let data = build_ix_data(&DISC_EXECUTE_SPLIT_TRANSFER, &payload);
         let metas = build_ix_metas(
             &s.transfer_auth, &s.token_state_pda, &s.mint,
@@ -283,7 +285,7 @@ mod execute_split_transfer {
             &s.incentive_pool_pda, s.bump, true, false,
         );
 
-        let payload = build_payload(s.user_id, s.company_id, 1_000_000, s.user_bump, s.company_bump, s.incentive_bump, "mixed_payment");
+        let payload = build_payload(s.user_id, s.company_id, 1_000_000, 0, s.user_bump, s.company_bump, s.incentive_bump, "mixed_payment");
         let data = build_ix_data(&DISC_EXECUTE_SPLIT_TRANSFER, &payload);
         let metas = build_ix_metas(
             &wrong_auth, &s.token_state_pda, &s.mint,
@@ -310,7 +312,7 @@ mod execute_split_transfer {
             &s.incentive_pool_pda, s.bump, true, false,
         );
 
-        let payload = build_payload(s.user_id, s.company_id, 1_000_000, s.user_bump, s.company_bump, s.incentive_bump, "mixed_payment");
+        let payload = build_payload(s.user_id, s.company_id, 1_000_000, 0, s.user_bump, s.company_bump, s.incentive_bump, "mixed_payment");
         let data = build_ix_data(&DISC_EXECUTE_SPLIT_TRANSFER, &payload);
         let metas = build_ix_metas(
             &s.transfer_auth, &s.token_state_pda, &s.mint,
@@ -337,7 +339,7 @@ mod execute_split_transfer {
             &s.incentive_pool_pda, s.bump, true, false,
         );
 
-        let payload = build_payload(s.user_id, s.company_id, 1_000_000, s.user_bump, s.company_bump, s.incentive_bump, "mixed_payment");
+        let payload = build_payload(s.user_id, s.company_id, 1_000_000, 0, s.user_bump, s.company_bump, s.incentive_bump, "mixed_payment");
         let data = build_ix_data(&DISC_EXECUTE_SPLIT_TRANSFER, &payload);
         let metas = build_ix_metas(
             &s.transfer_auth, &s.token_state_pda, &s.mint,
@@ -364,7 +366,7 @@ mod execute_split_transfer {
             &s.incentive_pool_pda, s.bump, true, false,
         );
 
-        let payload = build_payload(s.user_id, s.company_id, 1_000_000, s.user_bump, s.company_bump, s.incentive_bump, "mixed_payment");
+        let payload = build_payload(s.user_id, s.company_id, 1_000_000, 0, s.user_bump, s.company_bump, s.incentive_bump, "mixed_payment");
         let data = build_ix_data(&DISC_EXECUTE_SPLIT_TRANSFER, &payload);
         let metas = build_ix_metas(
             &s.transfer_auth, &s.token_state_pda, &s.mint,
@@ -390,7 +392,7 @@ mod execute_split_transfer {
             &s.incentive_pool_pda, s.bump, true, false,
         );
 
-        let payload = build_payload(s.user_id, s.company_id, 1_000_000, s.user_bump, s.company_bump, s.incentive_bump, "mixed_payment");
+        let payload = build_payload(s.user_id, s.company_id, 1_000_000, 0, s.user_bump, s.company_bump, s.incentive_bump, "mixed_payment");
         let data = build_ix_data(&DISC_EXECUTE_SPLIT_TRANSFER, &payload);
         let metas = build_ix_metas(
             &s.transfer_auth, &s.token_state_pda, &s.mint,
@@ -418,7 +420,7 @@ mod execute_split_transfer {
             &s.incentive_pool_pda, s.bump, true, false,
         );
 
-        let payload = build_payload(s.user_id, s.company_id, 1_000_000, s.user_bump, s.company_bump, s.incentive_bump, "mixed_payment");
+        let payload = build_payload(s.user_id, s.company_id, 1_000_000, 0, s.user_bump, s.company_bump, s.incentive_bump, "mixed_payment");
         let data = build_ix_data(&DISC_EXECUTE_SPLIT_TRANSFER, &payload);
         let metas = build_ix_metas(
             &s.transfer_auth, &wrong_pda, &s.mint,
@@ -441,7 +443,7 @@ mod execute_split_transfer {
         let s = setup();
         let ts_data = vec![0u8; TOKEN_STATE_SIZE - 1]; // too short
 
-        let payload = build_payload(s.user_id, s.company_id, 1_000_000, s.user_bump, s.company_bump, s.incentive_bump, "mixed_payment");
+        let payload = build_payload(s.user_id, s.company_id, 1_000_000, 0, s.user_bump, s.company_bump, s.incentive_bump, "mixed_payment");
         let data = build_ix_data(&DISC_EXECUTE_SPLIT_TRANSFER, &payload);
         let metas = build_ix_metas(
             &s.transfer_auth, &s.token_state_pda, &s.mint,
@@ -473,7 +475,7 @@ mod execute_split_transfer {
             &s.incentive_pool_pda, s.bump, true, false,
         );
 
-        let payload = build_payload(s.user_id, s.company_id, 1_000_000, s.user_bump, s.company_bump, s.incentive_bump, "mixed_payment");
+        let payload = build_payload(s.user_id, s.company_id, 1_000_000, 0, s.user_bump, s.company_bump, s.incentive_bump, "mixed_payment");
         let data = build_ix_data(&DISC_EXECUTE_SPLIT_TRANSFER, &payload);
         let metas = build_ix_metas(
             &s.transfer_auth, &s.token_state_pda, &wrong_mint,
@@ -501,7 +503,7 @@ mod execute_split_transfer {
             &s.incentive_pool_pda, s.bump, true, false,
         );
 
-        let payload = build_payload(s.user_id, s.company_id, 1_000_000, s.user_bump, s.company_bump, s.incentive_bump, "mixed_payment");
+        let payload = build_payload(s.user_id, s.company_id, 1_000_000, 0, s.user_bump, s.company_bump, s.incentive_bump, "mixed_payment");
         let data = build_ix_data(&DISC_EXECUTE_SPLIT_TRANSFER, &payload);
 
         // Override accounts[8] with a wrong ctoken program
@@ -544,7 +546,7 @@ mod execute_split_transfer {
             &s.incentive_pool_pda, s.bump, true, false,
         );
 
-        let payload = build_payload(s.user_id, s.company_id, 1_000_000, s.user_bump, s.company_bump, s.incentive_bump, "mixed_payment");
+        let payload = build_payload(s.user_id, s.company_id, 1_000_000, 0, s.user_bump, s.company_bump, s.incentive_bump, "mixed_payment");
         let data = build_ix_data(&DISC_EXECUTE_SPLIT_TRANSFER, &payload);
         let metas = build_ix_metas(
             &s.transfer_auth, &s.token_state_pda, &s.mint,
@@ -587,7 +589,7 @@ mod execute_split_transfer {
             &s.incentive_pool_pda, s.bump, true, false,
         );
 
-        let payload = build_payload(s.user_id, s.company_id, 1_000_000, s.user_bump, s.company_bump, s.incentive_bump, "mixed_payment");
+        let payload = build_payload(s.user_id, s.company_id, 1_000_000, 0, s.user_bump, s.company_bump, s.incentive_bump, "mixed_payment");
         let data = build_ix_data(&DISC_EXECUTE_SPLIT_TRANSFER, &payload);
         let metas = build_ix_metas(
             &s.transfer_auth, &s.token_state_pda, &s.mint,
@@ -607,7 +609,7 @@ mod execute_split_transfer {
         // must be measured in a full Light Protocol integration environment
         // before production deploy.
         println!(
-            "  execute_split_transfer_compressed  CU: {:>6}  (validation-path only — 3×CPI CU unmeasured)",
+            "  execute_split_transfer_compressed  CU: {:>6}  (validation-path only — 2×CPI burn-free, CU unmeasured)",
             result.compute_units_consumed
         );
         assert!(
