@@ -4,7 +4,10 @@ use pinocchio::error::ProgramError;
 
 use crate::constants::{LIGHT_COMPRESSED_TOKEN_PROGRAM_ID, USER_SEED};
 use crate::error::ZupyTokenError;
-use crate::helpers::compressed_accounts::{cpi_decompress_to_spl, derive_spl_interface_pda};
+use crate::helpers::compressed_accounts::{
+    cpi_decompress_to_spl, derive_spl_interface_pda, parse_leaf_proof_fields,
+    DecompressToSplAccounts,
+};
 use crate::helpers::cpi::cpi_create_ata_if_needed;
 use crate::helpers::instruction_data::{parse_string, parse_u64, parse_u8};
 use crate::helpers::memo::validate_memo_format;
@@ -23,11 +26,11 @@ use crate::helpers::transfer_validation::{
 /// and destination. This instruction must create the dest_ata because external wallets are not
 /// PDAs and have no on-chain compressed-account storage.
 ///
-/// Accounts (13 minimum):
+/// Accounts (19):
 ///   0. transfer_authority       (signer)           — Backend authority (Vault Transit)
 ///   1. token_state              (read)             — Program state PDA
 ///   2. mint                     (read)             — ZUPY mint (Token-2022)
-///   3. user_pda                 (read)             — Source user PDA (signs decompress CPI)
+///   3. user_pda                 (read)             — Source user PDA (leaf owner, signs the CPI)
 ///   4. dest_wallet              (read)             — External wallet address (NOT a PDA)
 ///   5. dest_ata                 (writable)         — Destination ATA (created if needed)
 ///   6. fee_payer                (writable, signer) — Pays ATA rent + Light Protocol fees
@@ -37,17 +40,31 @@ use crate::helpers::transfer_validation::{
 ///   10. compressed_token_program (read)            — Light cToken Program
 ///   11. compressed_token_authority (read)          — Light cToken authority PDA
 ///   12. spl_interface_pda       (writable)         — Light SPL pool PDA (seeds=[b"pool", mint])
-///   13+ Light system accounts                      — Merkle tree, nullifier queue, noop (client-injected)
+///   13. light_system_program    (read)
+///   14. registered_program_pda  (read)
+///   15. account_compression_authority (read)
+///   16. account_compression_program   (read)
+///   17. merkle_tree             (writable)
+///   18. output_queue            (writable)
 ///
-/// Data: amount (u64, bytes 0–7) + user_id (u64, bytes 8–15) + user_bump (u8, byte 16) + memo (String, bytes 17+)
+/// Accounts 13-18 replace the former open-ended `accounts[13..]` tail: spending a
+/// leaf routes the cToken through the light-system program, whose account prefix
+/// is fixed and position-sensitive, so it is named rather than client-assembled.
+/// `noop` is NOT part of it.
+///
+/// Data: amount (u64, 0–7) + user_id (u64, 8–15) + user_bump (u8, 16)
+///       + leaf/proof block (17..161, see `LEAF_PROOF_WIRE_LEN`) + memo (String, 161+)
 /// Discriminator: [114, 198, 185, 119, 169, 163, 29, 251] (SHA256("global:withdraw_to_external"))
+///
+/// The sender MUST prepend a `ComputeBudget` limit — this costs ~211k CU against a
+/// v1 state tree, over Solana's 200k default.
 pub fn process(
     program_id: &Address,
     accounts: &[AccountView],
     data: &[u8],
 ) -> ProgramResult {
     // 1. Account count check (MUST be first)
-    if accounts.len() < 13 {
+    if accounts.len() < 19 {
         return Err(ProgramError::NotEnoughAccountKeys);
     }
 
@@ -66,12 +83,21 @@ pub fn process(
     let compressed_token_prog = &accounts[10];
     let compressed_token_auth = &accounts[11];
     let spl_interface_pda     = &accounts[12];
+    // Light system accounts — named, not an anonymous tail: declaring in_token_data
+    // routes through the light-system program, whose prefix is position-sensitive.
+    let light_system_program  = &accounts[13];
+    let registered_program_pda = &accounts[14];
+    let account_compression_authority = &accounts[15];
+    let account_compression_program   = &accounts[16];
+    let merkle_tree           = &accounts[17];
+    let output_queue          = &accounts[18];
 
-    // 3. Parse instruction data (UNCHANGED)
+    // 3. Parse instruction data
     let amount    = parse_u64(data, 0)?;
     let user_id   = parse_u64(data, 8)?;
     let user_bump = parse_u8(data, 16)?;
-    let (memo, _) = parse_string(data, 17)?;
+    let (leaf_fields, memo_offset) = parse_leaf_proof_fields(data, 17)?;
+    let (memo, _) = parse_string(data, memo_offset)?;
 
     // 4. Validate zero amount (UNCHANGED)
     if amount == 0 {
@@ -143,18 +169,23 @@ pub fn process(
     let signer = Signer::from(&signer_seeds);
 
     cpi_decompress_to_spl(
-        compressed_token_prog,
-        compressed_token_auth,
-        fee_payer,
-        mint,
-        dest_ata,          // destination SPL (external wallet's ATA)
-        user_pda,          // authority (source owner, signs decompress)
-        spl_interface_pda,
-        token_program,
-        system_program,
-        amount,
-        spl_bump,
-        &accounts[13..],   // remaining Light system accounts (Merkle tree, nullifier queue, noop)
+        &DecompressToSplAccounts {
+            light_system_program,
+            payer: fee_payer,
+            compressed_token_authority: compressed_token_auth,
+            registered_program_pda,
+            account_compression_authority,
+            account_compression_program,
+            system_program,
+            merkle_tree,
+            output_queue,
+            authority: user_pda,        // leaf owner, signs decompress
+            mint,
+            destination_spl: dest_ata,  // external wallet's ATA
+            spl_interface_pda,
+            spl_token_program: token_program,
+        },
+        &leaf_fields.into_params(amount, spl_bump),
         &[signer],
     )?;
 

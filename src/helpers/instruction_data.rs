@@ -24,6 +24,32 @@ pub fn parse_bool(data: &[u8], offset: usize) -> Result<bool, ProgramError> {
     Ok(data[offset] != 0)
 }
 
+/// Parse a u32 (4-byte little-endian) from instruction data at the given offset.
+/// Returns `InvalidInstructionData` if not enough bytes remain.
+#[inline(always)]
+pub fn parse_u32(data: &[u8], offset: usize) -> Result<u32, ProgramError> {
+    let end = offset.checked_add(4).ok_or(ProgramError::InvalidInstructionData)?;
+    if data.len() < end {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    Ok(u32::from_le_bytes(
+        data[offset..offset + 4].try_into().unwrap(),
+    ))
+}
+
+/// Parse a u16 (2-byte little-endian) from instruction data at the given offset.
+/// Returns `InvalidInstructionData` if not enough bytes remain.
+#[inline(always)]
+pub fn parse_u16(data: &[u8], offset: usize) -> Result<u16, ProgramError> {
+    let end = offset.checked_add(2).ok_or(ProgramError::InvalidInstructionData)?;
+    if data.len() < end {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    Ok(u16::from_le_bytes(
+        data[offset..offset + 2].try_into().unwrap(),
+    ))
+}
+
 /// Parse a single u8 from instruction data at the given offset.
 /// Returns `InvalidInstructionData` if not enough bytes remain.
 #[inline(always)]

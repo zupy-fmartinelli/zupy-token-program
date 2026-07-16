@@ -68,6 +68,7 @@ use pinocchio::error::ProgramError;
 use pinocchio::instruction::{InstructionAccount, InstructionView};
 
 use crate::constants::{LIGHT_COMPRESSED_TOKEN_PROGRAM_ID, TOKEN_DECIMALS};
+use crate::helpers::instruction_data::{parse_bool, parse_bytes, parse_u16, parse_u32, parse_u64, parse_u8};
 
 /// Append each remaining account as an `InstructionAccount` meta, preserving its
 /// writable/signer flags. Shared by every compressed-token CPI builder — dedups
@@ -211,81 +212,157 @@ pub(crate) fn build_compress_with_remaining_data(owner: &[u8; 32], remaining: u6
     d
 }
 
-/// Builds the 59-byte Borsh-encoded `CompressedTokenInstructionDataTransfer2` for a
-/// **Path A decompress** operation (compressed leaf → Pool ATA).
+// ── Packed account indices for the decompress path ────────────────────────────
+//
+// `packed_accounts` are the accounts AFTER the 7 light-system accounts (see
+// `cpi_decompress_to_spl`). Trees and queues MUST come first — the SDK states it
+// outright (`light-compressed-token-sdk` `transfer2/cpi_accounts.rs:37`: "Trees
+// and queues must be first") and `pack_merkle_context` assigns their indices by
+// inserting tree then queue before anything else.
+const PACKED_TREE: u8 = 0;
+const PACKED_QUEUE: u8 = 1;
+const PACKED_OWNER: u8 = 2; // entity PDA — the LEAF OWNER (readonly signer)
+const PACKED_MINT: u8 = 3;
+const PACKED_POOL_ATA: u8 = 4; // SPL destination
+const PACKED_SPL_INTERFACE: u8 = 5; // omnibus (holds the locked SPL)
+
+/// Total size of the Transfer2 payload built by [`build_decompress_to_spl_data`].
+pub(crate) const DECOMPRESS_TO_SPL_DATA_LEN: usize = 206;
+
+/// Everything the Transfer2 decompress payload needs that only the client knows.
 ///
-/// **Layout verification:** Byte offsets derived from `light-token-interface 0.5.0` source
-/// (`Compression::decompress_spl` and `Compression::compress` factory methods).
-/// Same 59-byte structure as the old Transfer2 format (modes swapped) with
-/// account indices adjusted for reversed roles:
+/// The Photon-derived fields (`version`, `leaf_index`, `root_index`,
+/// `prove_by_index`, `leaf_amount`, `proof`) cannot be computed on-chain — they
+/// describe a Merkle leaf and its ZK proof, so they must arrive over the wire.
+pub struct DecompressToSplParams<'a> {
+    /// Tokens to release from the omnibus into the pool ATA.
+    pub amount: u64,
+    /// FULL balance of the leaf being spent (not `amount`) — seeds the sum check.
+    pub leaf_amount: u64,
+    /// Bump of the `spl_interface_pda` (omnibus).
+    pub spl_bump: u8,
+    /// `TokenDataVersion` of THIS leaf. Read it per leaf; never hardcode — it
+    /// selects the hash algorithm (V1 hashes the amount LE, V2 BE), so a wrong
+    /// value yields a leaf hash that misses the tree and the proof is rejected.
+    pub version: u8,
+    /// Leaf index within the Merkle tree.
+    pub leaf_index: u32,
+    /// Index of the root the proof was generated against. Volatile — the client
+    /// must fetch it fresh per attempt and never cache it.
+    pub root_index: u16,
+    /// Whether the leaf is provable by index (then the ZK proof is redundant).
+    pub prove_by_index: bool,
+    /// Groth16 validity proof from Photon: a[32] | b[64] | c[32].
+    pub proof: &'a [u8; 128],
+}
+
+/// Builds the 206-byte Borsh-encoded `CompressedTokenInstructionDataTransfer2`
+/// that decompresses part of a compressed leaf into the pool ATA.
 ///
-/// Packed account layout (6 packed, no separate SPL source ATA):
-///   - packed[0] = mint
-///   - packed[1] = destination_spl (pool_ata — receives unlocked SPL)
-///   - packed[2] = authority (source PDA — compressed account signer)
-///   - packed[3] = spl_interface_pda (holds locked SPL)
+/// # Why this shape (and why the old one could never work)
+///
+/// The previous builder emitted TWO compressions — `[Decompress, Compress]` —
+/// with an EMPTY `in_token_data`, and failed 100% of the time with cToken error
+/// **6005 = `SumCheckFailed`** ("Cannot decompress if no balance exists").
+///
+/// Two independent defects, one design error:
+///
+/// 1. **Sum check.** The cToken tracks per-mint balances in an in-memory
+///    `ArrayMap` seeded ONLY by `in_token_data`. With no inputs the map is empty,
+///    so the first `Decompress` finds no entry for the mint and bails — before
+///    touching a single account, in ~3k CU. The message names neither the
+///    omnibus (which holds 704k Z$) nor the company leaves (which exist).
+/// 2. **`Compress` cannot spend a leaf.** `CompressionMode::Compress` moves
+///    tokens out of an on-chain ctoken ACCOUNT into the pool. The entity PDA is
+///    NOT an account — it is only the `owner` field of Merkle leaves. A leaf is
+///    spent by declaring it in `in_token_data` with a validity proof, which is
+///    exactly what this builder now does.
+///
+/// Sum check here: `+leaf_amount − amount − (leaf_amount − amount) = 0`.
+/// Because `in_token_data` seeds the map, compression ORDER is no longer
+/// load-bearing.
+///
+/// # Layout (verified byte-for-byte by a clean mainnet simulation)
 ///
 /// ```text
-/// [0]     disc = 101
-/// [1..5]  header flags = 0
-/// [6..7]  max_top_up = u16::MAX (LE) — no top-up limit
-/// [8]     cpi_context = None (0)
-/// [9]     compressions = Some (1)
-/// [10..13] vec len = 2 (u32 LE)
-/// [14..29] Compression 0: decompress_spl(amount, mint=0, recipient=1, pool=3, idx=0, bump, dec=6)
-/// [30..45] Compression 1: compress(amount, mint=0, source=2, auth=2)
-/// [46]    proof = None (0)
-/// [47..50] in_token_data len = 0 (u32 LE)
-/// [51..54] out_token_data len = 0 (u32 LE)
-/// [55..58] in/out lamports/tlv = None (all zeros)
+/// [  0]      disc = 101
+/// [  1..  5] header flags = 0
+/// [  5]      output_queue = PACKED_TREE — an INDEX, and it points at the TREE,
+///            not the queue: the public state tree is StateV1 (legacy), whose
+///            outputs are appended to the tree itself. Pointing it at the queue
+///            fails with 6042.
+/// [  6..  8] max_top_up = u16::MAX (LE)
+/// [  8]      cpi_context = None
+/// [  9.. 14] compressions = Some, len = 1 (u32 LE)
+/// [ 14.. 30] Compression: decompress_spl(amount, mint, pool_ata, omnibus, 0, bump, 6)
+/// [ 30..159] proof = Some + a[32] b[64] c[32]
+/// [159..185] in_token_data = len 1 + MultiInputTokenDataWithContext (22B)
+/// [185..202] out_token_data = len 1 + MultiTokenTransferOutputData (13B) — change
+/// [202..206] in_lamports / out_lamports / in_tlv / out_tlv = None
 /// ```
+///
+/// Vec lengths are u32 LE (not ULEB): `ZeroCopySliceBorsh = ZeroCopySlice<U32,…>`.
+/// No padding despite `#[repr(C)]` — the zero-copy derive is Borsh-compatible and
+/// the meta structs are `Unaligned`.
+///
+/// # Caller obligation
+///
+/// This instruction costs ~211k CU against a v1 tree, over Solana's 200k default.
+/// The sender MUST prepend a `ComputeBudget` limit or the tx dies with
+/// `ProgramFailedToComplete` even though these bytes are correct.
 #[inline]
-pub(crate) fn build_decompress_to_spl_data(amount: u64, spl_bump: u8) -> [u8; 59] {
-    let mut d = [0u8; 59];
-    let ab = amount.to_le_bytes();
+pub(crate) fn build_decompress_to_spl_data(
+    params: &DecompressToSplParams,
+) -> [u8; DECOMPRESS_TO_SPL_DATA_LEN] {
+    let mut d = [0u8; DECOMPRESS_TO_SPL_DATA_LEN];
 
     // ── Header ───────────────────────────────────────────────────────────────
     d[0] = TRANSFER2_DISC;
-    // d[1] = with_transaction_hash: false (0)
-    // d[2] = with_lamports_change_account_merkle_tree_index: false (0)
-    // d[3] = lamports_change_account_merkle_tree_index: 0
-    // d[4] = lamports_change_account_owner_index: 0
-    // d[5] = output_queue: 0
-    d[6] = 0xFF; // max_top_up low byte
-    d[7] = 0xFF; // max_top_up high byte (= u16::MAX)
-    // d[8] = cpi_context: None (0)
-    // ── compressions: Some(vec![...]) ────────────────────────────────────────
+    // d[1..5] = with_transaction_hash / lamports-change placeholders = 0
+    d[5] = PACKED_TREE; // output_queue (see doc: index, and it is the TREE)
+    d[6] = 0xFF; // max_top_up = u16::MAX
+    d[7] = 0xFF;
+    // d[8] = cpi_context: None
+
+    // ── compressions: Some(vec![decompress_spl]) ─────────────────────────────
     d[9] = 1; // Some
-    d[10] = 2; // vec len low byte (= 2, u32 LE)
-    // d[11..13] = 0 (high bytes of u32 len)
-    // ── Compression 0: decompress_spl (releases SPL from spl_interface_pda to pool_ata) ──
-    d[14] = 1; // mode: CompressionMode::Decompress = 1
-    d[15..23].copy_from_slice(&ab); // amount (u64 LE)
-    // d[23] = mint index = 0 (packed[0])
-    d[24] = 1; // source_or_recipient = 1 (packed[1] = pool_ata, SPL destination)
-    // d[25] = authority = 0 (UNUSED for decompress_spl per light-token-interface source)
-    d[26] = 3; // pool_account_index = 3 (packed[3] = spl_interface_pda)
+    d[10] = 1; // vec len = 1 (u32 LE, high bytes stay 0)
+    d[14] = 1; // mode: CompressionMode::Decompress
+    d[15..23].copy_from_slice(&params.amount.to_le_bytes());
+    d[23] = PACKED_MINT;
+    d[24] = PACKED_POOL_ATA; // source_or_recipient = SPL destination
+    // d[25] = authority: unused for decompress_spl
+    d[26] = PACKED_SPL_INTERFACE; // pool_account_index = omnibus
     // d[27] = pool_index = 0
-    d[28] = spl_bump; // spl_interface_pda bump
-    d[29] = TOKEN_DECIMALS; // decimals = 6
-    // ── Compression 1: compress (spends the authority's compressed account) ─────
-    d[30] = 0; // mode: CompressionMode::Compress = 0
-    d[31..39].copy_from_slice(&ab); // amount (u64 LE)
-    // d[39] = mint index = 0 (packed[0])
-    d[40] = 2; // source_or_recipient = 2 (packed[2] = source PDA, compressed source)
-    d[41] = 2; // authority = 2 (packed[2] = source PDA, signer)
-    // d[42] = pool_account_index = 0 (unused — no pool for compress without SPL)
-    // d[43] = pool_index = 0 (unused)
-    // d[44] = bump = 0 (unused)
-    // d[45] = decimals = 0 (unused)
-    // ── Trailing None/empty fields ────────────────────────────────────────────
-    // d[46] = proof: None (0)
-    // d[47..50] = in_token_data: vec![] len = 0 (all zeros)
-    // d[51..54] = out_token_data: vec![] len = 0 (all zeros)
-    // d[55] = in_lamports: None (0)
-    // d[56] = out_lamports: None (0)
-    // d[57] = in_tlv: None (0)
-    // d[58] = out_tlv: None (0)
+    d[28] = params.spl_bump;
+    d[29] = TOKEN_DECIMALS;
+
+    // ── proof: Some(CompressedProof) ─────────────────────────────────────────
+    d[30] = 1; // Some
+    d[31..159].copy_from_slice(params.proof.as_ref());
+
+    // ── in_token_data: the leaf being spent (this is what seeds the sum check) ─
+    d[159] = 1; // vec len = 1 (u32 LE)
+    d[163] = PACKED_OWNER;
+    d[164..172].copy_from_slice(&params.leaf_amount.to_le_bytes());
+    // d[172] = has_delegate: false, d[173] = delegate: 0
+    d[174] = PACKED_MINT;
+    d[175] = params.version;
+    d[176] = PACKED_TREE; // merkle_context.merkle_tree_pubkey_index
+    d[177] = PACKED_QUEUE; // merkle_context.queue_pubkey_index
+    d[178..182].copy_from_slice(&params.leaf_index.to_le_bytes());
+    d[182] = params.prove_by_index as u8;
+    d[183..185].copy_from_slice(&params.root_index.to_le_bytes());
+
+    // ── out_token_data: the change leaf (leaf_amount - amount) ───────────────
+    d[185] = 1; // vec len = 1 (u32 LE)
+    d[189] = PACKED_OWNER;
+    let change = params.leaf_amount.saturating_sub(params.amount);
+    d[190..198].copy_from_slice(&change.to_le_bytes());
+    // d[198] = has_delegate: false, d[199] = delegate: 0
+    d[200] = PACKED_MINT;
+    d[201] = params.version;
+    // d[202..206] = in_lamports / out_lamports / in_tlv / out_tlv = None
 
     d
 }
@@ -398,66 +475,156 @@ pub fn cpi_compress_from_spl<'a>(
 
 // ── Path A (reverse): cpi_decompress_to_spl ───────────────────────────────────
 
-/// CPI: Decompress tokens from a compressed leaf into a destination SPL ATA (pool_ata).
+/// Wire size of the leaf/proof block parsed by [`parse_leaf_proof_fields`].
 ///
-/// **Path A (reverse)** — no ZK proof required. Reverse of [`cpi_compress_from_spl`].
-/// Used by `return_to_pool` and `return_user_to_pool`.
+/// `leaf_amount(8) + version(1) + leaf_index(4) + root_index(2) + prove_by_index(1) + proof(128)`
+pub const LEAF_PROOF_WIRE_LEN: usize = 144;
+
+/// Parse the leaf + validity-proof block that every decompress instruction carries.
 ///
-/// Simulation with disc=101, 59-byte instruction data, and 8 fixed accounts produced
-/// `"Program log: Transfer2"` + `"Cannot decompress if no balance exists"` (error 6005).
-/// This confirms the instruction dispatches, accounts are accepted, and the program reaches
-/// business logic. Error 6005 = expected when `spl_interface_pda` holds no SPL balance.
+/// These values are Photon-derived and cannot be recomputed on-chain, so they
+/// travel over the wire. Shared by `return_to_pool`, `return_user_to_pool` and
+/// `withdraw_to_external` — all three spend a leaf via `cpi_decompress_to_spl`.
 ///
-/// Two `Compression` entries processed atomically:
-/// 1. `decompress_spl`: releases `amount` SPL tokens from `spl_interface_pda` to `destination_spl`.
-/// 2. `compress`: spends `amount` from `authority`'s compressed leaf (verified via Light system
-///    accounts at the end of the accounts slice).
+/// Returns the params (minus `amount`/`spl_bump`, which the caller owns) plus the
+/// offset just past the block.
+#[inline]
+pub fn parse_leaf_proof_fields(
+    data: &[u8],
+    offset: usize,
+) -> Result<(LeafProofFields<'_>, usize), ProgramError> {
+    let leaf_amount = parse_u64(data, offset)?;
+    let version = parse_u8(data, offset + 8)?;
+    let leaf_index = parse_u32(data, offset + 9)?;
+    let root_index = parse_u16(data, offset + 13)?;
+    let prove_by_index = parse_bool(data, offset + 15)?;
+    let (proof, next) = parse_bytes::<128>(data, offset + 16)?;
+    Ok((
+        LeafProofFields {
+            leaf_amount,
+            version,
+            leaf_index,
+            root_index,
+            prove_by_index,
+            proof,
+        },
+        next,
+    ))
+}
+
+/// The Photon-derived half of [`DecompressToSplParams`], as it arrives on the wire.
+pub struct LeafProofFields<'a> {
+    pub leaf_amount: u64,
+    pub version: u8,
+    pub leaf_index: u32,
+    pub root_index: u16,
+    pub prove_by_index: bool,
+    pub proof: &'a [u8; 128],
+}
+
+impl<'a> LeafProofFields<'a> {
+    /// Combine the wire fields with the caller-owned `amount` and omnibus bump.
+    #[inline]
+    pub fn into_params(self, amount: u64, spl_bump: u8) -> DecompressToSplParams<'a> {
+        DecompressToSplParams {
+            amount,
+            leaf_amount: self.leaf_amount,
+            spl_bump,
+            version: self.version,
+            leaf_index: self.leaf_index,
+            root_index: self.root_index,
+            prove_by_index: self.prove_by_index,
+            proof: self.proof,
+        }
+    }
+}
+
+/// The accounts a Transfer2 decompress CPI needs, in the order the cToken expects.
 ///
-/// ## Account order passed to cToken program
+/// Grouped into a struct because the flat argument list crossed the point where
+/// positional mistakes stop being caught by the type checker — every field here
+/// is an `AccountView` and a swap would compile silently.
+pub struct DecompressToSplAccounts<'a> {
+    // ── Light system accounts (fixed prefix, indices 0..7) ────────────────────
+    pub light_system_program: &'a AccountView,
+    pub payer: &'a AccountView,
+    pub compressed_token_authority: &'a AccountView,
+    pub registered_program_pda: &'a AccountView,
+    pub account_compression_authority: &'a AccountView,
+    pub account_compression_program: &'a AccountView,
+    pub system_program: &'a AccountView,
+    // ── Packed accounts (indices 7.., see PACKED_* constants) ────────────────
+    pub merkle_tree: &'a AccountView,
+    pub output_queue: &'a AccountView,
+    /// Entity PDA — the LEAF OWNER. Signs via `invoke_signed`.
+    pub authority: &'a AccountView,
+    pub mint: &'a AccountView,
+    pub destination_spl: &'a AccountView,
+    pub spl_interface_pda: &'a AccountView,
+    pub spl_token_program: &'a AccountView,
+}
+
+/// CPI: Decompress part of a compressed leaf into a destination SPL ATA (pool_ata).
+///
+/// Used by `return_to_pool` and `return_user_to_pool`. Both spend a Merkle leaf
+/// owned by an entity PDA, so both need the full ZK path — see
+/// [`build_decompress_to_spl_data`] for why the old proof-free shape always
+/// failed with 6005.
+///
+/// ## Account order passed to the cToken program
+///
+/// Declaring `in_token_data` flips `no_compressed_accounts` to false, which routes
+/// the cToken through the light-system program. That path takes a DIFFERENT,
+/// longer account prefix than the old compressions-only one: **packed accounts
+/// start at index 7, not 2** (`light-compressed-token-sdk`
+/// `transfer2/account_metas.rs`). `noop` is not part of it.
+///
 /// ```text
-/// [0] compressed_token_authority (readonly)
-/// [1] payer                       (writable, signer)
-/// packed:
-/// [2] mint                        (readonly)          → packed[0]
-/// [3] destination_spl (pool_ata)  (writable)          → packed[1]
-/// [4] authority (source PDA)      (readonly, signer)  → packed[2]
-/// [5] spl_interface_pda           (writable)          → packed[3]
-/// [6] spl_token_program           (readonly)          → packed[4]
-/// [7] system_program              (readonly)          → packed[5]
-/// [8+] Light system accounts (Merkle tree, nullifier queue, noop)
+/// [0] light_system_program           (readonly)
+/// [1] fee_payer                      (writable, signer)
+/// [2] cpi_authority_pda              (readonly)
+/// [3] registered_program_pda         (readonly)
+/// [4] account_compression_authority  (readonly)
+/// [5] account_compression_program    (readonly)
+/// [6] system_program                 (readonly)
+/// packed (trees and queues first):
+/// [7]  merkle_tree                   (writable)          → packed[0]
+/// [8]  output_queue                  (writable)          → packed[1]
+/// [9]  authority (entity PDA)        (readonly, signer)  → packed[2]  LEAF OWNER
+/// [10] mint                          (readonly)          → packed[3]
+/// [11] destination_spl (pool_ata)    (writable)          → packed[4]
+/// [12] spl_interface_pda             (writable)          → packed[5]
+/// [13] spl_token_program             (readonly)          → packed[6]
 /// ```
+///
+/// The entity PDA's role changed but its signature did not: it used to be the
+/// `source` of a `Compress`, it is now the owner of the input leaf, still marked
+/// `readonly_signer` and still signed for with the same `[seed, id, bump]` seeds.
 #[inline(always)]
-#[allow(clippy::too_many_arguments)]
-pub fn cpi_decompress_to_spl<'a>(
-    _compressed_token_program: &'a AccountView,
-    compressed_token_authority: &'a AccountView,
-    payer: &'a AccountView,
-    mint: &'a AccountView,
-    destination_spl: &'a AccountView,
-    authority: &'a AccountView,
-    spl_interface_pda: &'a AccountView,
-    spl_token_program: &'a AccountView,
-    system_program: &'a AccountView,
-    amount: u64,
-    spl_interface_pda_bump: u8,
-    remaining_accounts: &'a [AccountView],
+pub fn cpi_decompress_to_spl(
+    accounts: &DecompressToSplAccounts,
+    params: &DecompressToSplParams,
     signers: &[Signer],
 ) -> Result<(), ProgramError> {
-    let data = build_decompress_to_spl_data(amount, spl_interface_pda_bump);
-
+    let data = build_decompress_to_spl_data(params);
     let prog_id: Address = LIGHT_COMPRESSED_TOKEN_PROGRAM_ID.into();
 
-    // Build fixed account metas; append remaining Light system accounts (Merkle tree, etc.)
-    let mut account_metas = Vec::with_capacity(8 + remaining_accounts.len());
-    account_metas.push(InstructionAccount::readonly(compressed_token_authority.address()));  // [0]
-    account_metas.push(InstructionAccount::writable_signer(payer.address()));                // [1]
-    account_metas.push(InstructionAccount::readonly(mint.address()));                         // packed[0]
-    account_metas.push(InstructionAccount::writable(destination_spl.address()));             // packed[1]
-    account_metas.push(InstructionAccount::readonly_signer(authority.address()));            // packed[2]
-    account_metas.push(InstructionAccount::writable(spl_interface_pda.address()));           // packed[3]
-    account_metas.push(InstructionAccount::readonly(spl_token_program.address()));           // packed[4]
-    account_metas.push(InstructionAccount::readonly(system_program.address()));              // packed[5]
-    push_remaining_metas(&mut account_metas, remaining_accounts);
+    let account_metas = [
+        InstructionAccount::readonly(accounts.light_system_program.address()), // [0]
+        InstructionAccount::writable_signer(accounts.payer.address()),         // [1]
+        InstructionAccount::readonly(accounts.compressed_token_authority.address()), // [2]
+        InstructionAccount::readonly(accounts.registered_program_pda.address()), // [3]
+        InstructionAccount::readonly(accounts.account_compression_authority.address()), // [4]
+        InstructionAccount::readonly(accounts.account_compression_program.address()), // [5]
+        InstructionAccount::readonly(accounts.system_program.address()),      // [6]
+        InstructionAccount::writable(accounts.merkle_tree.address()),         // packed[0]
+        InstructionAccount::writable(accounts.output_queue.address()),        // packed[1]
+        InstructionAccount::readonly_signer(accounts.authority.address()),    // packed[2]
+        InstructionAccount::readonly(accounts.mint.address()),                // packed[3]
+        InstructionAccount::writable(accounts.destination_spl.address()),     // packed[4]
+        InstructionAccount::writable(accounts.spl_interface_pda.address()),   // packed[5]
+        InstructionAccount::readonly(accounts.spl_token_program.address()),   // packed[6]
+    ];
 
     let instruction = InstructionView {
         program_id: &prog_id,
@@ -465,21 +632,25 @@ pub fn cpi_decompress_to_spl<'a>(
         data: &data,
     };
 
-    // Build account view slice matching instruction.accounts 1:1 (no program account).
-    // Pinocchio 0.10 resolves the CPI target program from InstructionView.program_id,
-    // NOT from the account_views slice. Including the program here would shift
-    // remaining_accounts by one position, causing pubkey mismatches in
-    // inner_invoke_signed_with_slice (ProgramError::InvalidArgument).
-    let mut account_views: Vec<&AccountView> = Vec::with_capacity(8 + remaining_accounts.len());
-    account_views.push(compressed_token_authority);
-    account_views.push(payer);
-    account_views.push(mint);
-    account_views.push(destination_spl);
-    account_views.push(authority);
-    account_views.push(spl_interface_pda);
-    account_views.push(spl_token_program);
-    account_views.push(system_program);
-    account_views.extend(remaining_accounts.iter());
+    // Account views must match instruction.accounts 1:1 (no program account).
+    // Pinocchio 0.10 resolves the CPI target from InstructionView.program_id;
+    // including the program here would shift every index by one.
+    let account_views: [&AccountView; 14] = [
+        accounts.light_system_program,
+        accounts.payer,
+        accounts.compressed_token_authority,
+        accounts.registered_program_pda,
+        accounts.account_compression_authority,
+        accounts.account_compression_program,
+        accounts.system_program,
+        accounts.merkle_tree,
+        accounts.output_queue,
+        accounts.authority,
+        accounts.mint,
+        accounts.destination_spl,
+        accounts.spl_interface_pda,
+        accounts.spl_token_program,
+    ];
 
     pinocchio::cpi::invoke_signed_with_slice(&instruction, &account_views, signers)?;
     Ok(())
@@ -970,131 +1141,316 @@ mod tests {
     }
 
     // ── build_decompress_to_spl_data ─────────────────────────────────────────
+    //
+    // GR23 — the previous 19 tests here pinned the OLD 59-byte shape: two
+    // compressions `[Decompress, Compress]`, `proof: None`, empty in/out token
+    // data, packed base 2. They are deleted rather than adapted because their
+    // premise was proven impossible, not merely outdated: that shape can never
+    // succeed (cToken 6005 = SumCheckFailed, 100% of the time in production).
+    // Keeping them would pin a contract that does not exist.
+    //
+    // The expectations below are anchored to a CLEAN mainnet simulation
+    // (`err: null`, 210.792 CU) against the real cToken and the real leaves.
+
+    /// Field values from the proven mainnet simulation (Ettus Motel, 1 Z$ debit).
+    fn proven_params(proof: &[u8; 128]) -> DecompressToSplParams<'_> {
+        DecompressToSplParams {
+            amount: 1_000_000,          // 1 Z$
+            leaf_amount: 3_943_000_000, // full balance of the spent leaf
+            spl_bump: 255,
+            version: 1, // V1 — read from the leaf discriminator, never hardcoded
+            leaf_index: 59_990_408,
+            root_index: 1634,
+            prove_by_index: false,
+            proof,
+        }
+    }
 
     #[test]
-    /// Discriminator confirmed correct from light-token-pinocchio 0.22.0 SDK source
-    /// (transfer_to_spl.rs: `TRANSFER2_DISCRIMINATOR: u8 = 101`).
+    fn test_build_decompress_to_spl_data_total_length_is_206() {
+        let p = [7u8; 128];
+        let data = build_decompress_to_spl_data(&proven_params(&p));
+        assert_eq!(data.len(), DECOMPRESS_TO_SPL_DATA_LEN);
+        assert_eq!(data.len(), 206, "proven layout is 206 bytes");
+    }
+
+    #[test]
     fn test_build_decompress_to_spl_data_discriminator_is_101() {
-        let data = build_decompress_to_spl_data(1_000_000, 255);
-        assert_eq!(data[0], TRANSFER2_DISC, "first byte must be Transfer2 discriminator (101)");
+        let p = [0u8; 128];
+        let data = build_decompress_to_spl_data(&proven_params(&p));
+        assert_eq!(data[0], TRANSFER2_DISC);
         assert_eq!(data[0], 101);
     }
 
     #[test]
-    fn test_build_decompress_to_spl_data_total_length_is_59() {
-        let data = build_decompress_to_spl_data(0, 0);
-        assert_eq!(data.len(), 59, "instruction data must be exactly 59 bytes");
+    fn test_output_queue_points_at_the_tree_not_the_queue() {
+        // The public state tree is StateV1 (legacy): outputs are appended to the
+        // tree itself. Pointing output_queue at the queue fails with 6042 —
+        // verified by simulation.
+        let p = [0u8; 128];
+        let data = build_decompress_to_spl_data(&proven_params(&p));
+        assert_eq!(data[5], PACKED_TREE, "output_queue must be the TREE index");
+        assert_ne!(data[5], PACKED_QUEUE, "pointing at the queue yields 6042");
     }
 
     #[test]
-    fn test_build_decompress_to_spl_data_max_top_up_is_u16_max() {
-        let data = build_decompress_to_spl_data(0, 0);
-        assert_eq!(data[6], 0xFF, "max_top_up low byte");
-        assert_eq!(data[7], 0xFF, "max_top_up high byte (u16::MAX)");
+    fn test_max_top_up_is_u16_max() {
+        let p = [0u8; 128];
+        let data = build_decompress_to_spl_data(&proven_params(&p));
+        assert_eq!(&data[6..8], &[0xFF, 0xFF]);
     }
 
     #[test]
-    fn test_build_decompress_to_spl_data_compressions_is_some_with_two_entries() {
-        let data = build_decompress_to_spl_data(0, 0);
-        assert_eq!(data[9], 1, "compressions: Some = 1");
-        assert_eq!(&data[10..14], &[2, 0, 0, 0], "vec len = 2 (u32 LE)");
+    fn test_exactly_one_compression_and_it_is_decompress() {
+        // The old builder emitted two ([Decompress, Compress]); the `Compress`
+        // entry could never spend a leaf (the PDA is not an account) and the
+        // empty mint_sums map made the Decompress fail the sum check first.
+        let p = [0u8; 128];
+        let data = build_decompress_to_spl_data(&proven_params(&p));
+        assert_eq!(data[9], 1, "compressions: Some");
+        assert_eq!(&data[10..14], &[1, 0, 0, 0], "vec len = 1 (u32 LE), not 2");
+        assert_eq!(data[14], 1, "mode = CompressionMode::Decompress");
     }
 
     #[test]
-    fn test_build_decompress_to_spl_data_compression0_mode_is_decompress() {
-        let data = build_decompress_to_spl_data(0, 0);
-        assert_eq!(data[14], 1, "Compression 0 mode: Decompress = 1");
-    }
-
-    #[test]
-    fn test_build_decompress_to_spl_data_compression0_amount_encoded_correctly() {
-        let amount = 42_000_000u64; // 42 ZUPY
-        let data = build_decompress_to_spl_data(amount, 0);
-        let encoded = u64::from_le_bytes(data[15..23].try_into().unwrap());
-        assert_eq!(encoded, amount, "Compression 0 amount (u64 LE) at [15..23]");
-    }
-
-    #[test]
-    fn test_build_decompress_to_spl_data_compression0_account_indices() {
-        let data = build_decompress_to_spl_data(0, 0);
-        assert_eq!(data[23], 0, "mint index = packed[0]");
-        assert_eq!(data[24], 1, "source_or_recipient = packed[1] (pool_ata, SPL destination)");
-        assert_eq!(data[25], 0, "authority = 0 (UNUSED for decompress_spl)");
-        assert_eq!(data[26], 3, "pool_account_index = packed[3] (spl_interface_pda)");
+    fn test_compression_amount_and_indices() {
+        let p = [0u8; 128];
+        let data = build_decompress_to_spl_data(&proven_params(&p));
+        assert_eq!(
+            u64::from_le_bytes(data[15..23].try_into().unwrap()),
+            1_000_000,
+        );
+        assert_eq!(data[23], PACKED_MINT);
+        assert_eq!(data[24], PACKED_POOL_ATA, "source_or_recipient = SPL dest");
+        assert_eq!(data[25], 0, "authority unused for decompress_spl");
+        assert_eq!(data[26], PACKED_SPL_INTERFACE, "pool_account_index = omnibus");
         assert_eq!(data[27], 0, "pool_index = 0");
+        assert_eq!(data[28], 255, "spl_interface_pda bump");
+        assert_eq!(data[29], TOKEN_DECIMALS);
     }
 
     #[test]
-    fn test_build_decompress_to_spl_data_compression0_bump_stored_correctly() {
-        let bump: u8 = 251;
-        let data = build_decompress_to_spl_data(0, bump);
-        assert_eq!(data[28], bump, "spl_interface_pda bump stored at [28]");
+    fn test_proof_is_some_and_copied_verbatim() {
+        let mut proof = [0u8; 128];
+        for (i, b) in proof.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let data = build_decompress_to_spl_data(&proven_params(&proof));
+        assert_eq!(data[30], 1, "proof: Some — the sum check needs the leaf proven");
+        assert_eq!(&data[31..159], proof.as_ref());
     }
 
     #[test]
-    fn test_build_decompress_to_spl_data_compression0_decimals_is_token_decimals() {
-        let data = build_decompress_to_spl_data(0, 0);
-        assert_eq!(data[29], TOKEN_DECIMALS, "Compression 0 decimals = TOKEN_DECIMALS (6)");
+    fn test_in_token_data_declares_the_leaf() {
+        // This is the actual fix: in_token_data is the ONLY thing that seeds the
+        // cToken's per-mint balance map. Empty => 6005 regardless of real balances.
+        let p = [0u8; 128];
+        let data = build_decompress_to_spl_data(&proven_params(&p));
+        assert_eq!(&data[159..163], &[1, 0, 0, 0], "in_token_data len = 1");
+        assert_eq!(data[163], PACKED_OWNER, "leaf owner = entity PDA");
+        assert_eq!(
+            u64::from_le_bytes(data[164..172].try_into().unwrap()),
+            3_943_000_000,
+            "must be the FULL leaf amount, not the debit amount",
+        );
+        assert_eq!(data[172], 0, "has_delegate = false");
+        assert_eq!(data[173], 0, "delegate = 0");
+        assert_eq!(data[174], PACKED_MINT);
+        assert_eq!(data[175], 1, "version = V1");
+        assert_eq!(data[176], PACKED_TREE, "merkle_tree_pubkey_index");
+        assert_eq!(data[177], PACKED_QUEUE, "queue_pubkey_index");
+        assert_eq!(
+            u32::from_le_bytes(data[178..182].try_into().unwrap()),
+            59_990_408,
+        );
+        assert_eq!(data[182], 0, "prove_by_index = false");
+        assert_eq!(u16::from_le_bytes(data[183..185].try_into().unwrap()), 1634);
     }
 
     #[test]
-    fn test_build_decompress_to_spl_data_compression1_mode_is_compress() {
-        let data = build_decompress_to_spl_data(0, 0);
-        assert_eq!(data[30], 0, "Compression 1 mode: Compress = 0");
+    fn test_out_token_data_is_the_change_leaf() {
+        let p = [0u8; 128];
+        let data = build_decompress_to_spl_data(&proven_params(&p));
+        assert_eq!(&data[185..189], &[1, 0, 0, 0], "out_token_data len = 1");
+        assert_eq!(data[189], PACKED_OWNER, "change returns to the same owner");
+        assert_eq!(
+            u64::from_le_bytes(data[190..198].try_into().unwrap()),
+            3_943_000_000 - 1_000_000,
+            "change = leaf_amount - amount",
+        );
+        assert_eq!(data[200], PACKED_MINT);
+        assert_eq!(data[201], 1, "version must match the input leaf");
     }
 
     #[test]
-    fn test_build_decompress_to_spl_data_compression1_amount_equals_compression0_amount() {
-        let amount = 5_000_000_000u64; // 5,000 ZUPY
-        let data = build_decompress_to_spl_data(amount, 0);
-        let c1_amount = u64::from_le_bytes(data[31..39].try_into().unwrap());
-        assert_eq!(c1_amount, amount, "Compression 1 amount must equal Compression 0 amount");
+    fn test_sum_check_balances_to_zero() {
+        // +leaf_amount (input) - amount (decompressed) - change (output) = 0.
+        // This identity is what 6005 was complaining about.
+        let p = [0u8; 128];
+        let params = proven_params(&p);
+        let data = build_decompress_to_spl_data(&params);
+        let decompressed = u64::from_le_bytes(data[15..23].try_into().unwrap());
+        let input = u64::from_le_bytes(data[164..172].try_into().unwrap());
+        let output = u64::from_le_bytes(data[190..198].try_into().unwrap());
+        assert_eq!(input, decompressed + output, "sum check must net to zero");
     }
 
     #[test]
-    fn test_build_decompress_to_spl_data_compression1_account_indices() {
-        let data = build_decompress_to_spl_data(0, 0);
-        assert_eq!(data[39], 0, "Compression 1 mint index = packed[0]");
-        assert_eq!(data[40], 2, "source_or_recipient = packed[2] (source PDA, compressed source)");
-        assert_eq!(data[41], 2, "authority = packed[2] (source PDA, signer)");
-        assert_eq!(data[42], 0, "pool_account_index = 0 (unused)");
-        assert_eq!(data[43], 0, "pool_index = 0 (unused)");
-        assert_eq!(data[44], 0, "bump = 0 (unused)");
-        assert_eq!(data[45], 0, "decimals = 0 (unused)");
+    fn test_version_is_carried_not_hardcoded() {
+        // The version selects the leaf hash algorithm (V1 amount LE, V2 BE).
+        // Simulation: version=2 on a V1 leaf => 6043 ProofVerificationFailed.
+        let p = [0u8; 128];
+        for v in [1u8, 2, 3] {
+            let mut params = proven_params(&p);
+            params.version = v;
+            let data = build_decompress_to_spl_data(&params);
+            assert_eq!(data[175], v, "in_token_data version");
+            assert_eq!(data[201], v, "out_token_data version must match");
+        }
     }
 
     #[test]
-    fn test_build_decompress_to_spl_data_trailing_fields_are_zero_or_none() {
-        let data = build_decompress_to_spl_data(0, 0);
-        assert_eq!(data[46], 0, "proof: None");
-        assert_eq!(&data[47..51], &[0, 0, 0, 0], "in_token_data: empty vec");
-        assert_eq!(&data[51..55], &[0, 0, 0, 0], "out_token_data: empty vec");
-        assert_eq!(&data[55..59], &[0, 0, 0, 0], "remaining Option fields: None");
+    fn test_prove_by_index_true_is_encoded() {
+        let p = [0u8; 128];
+        let mut params = proven_params(&p);
+        params.prove_by_index = true;
+        let data = build_decompress_to_spl_data(&params);
+        assert_eq!(data[182], 1);
     }
 
     #[test]
-    fn test_build_decompress_to_spl_data_zero_amount_has_zero_amount_fields() {
-        let data = build_decompress_to_spl_data(0, 0);
-        assert_eq!(&data[15..23], &[0u8; 8], "amount=0 in Compression 0");
-        assert_eq!(&data[31..39], &[0u8; 8], "amount=0 in Compression 1");
+    fn test_full_leaf_spend_leaves_zero_change() {
+        let p = [0u8; 128];
+        let mut params = proven_params(&p);
+        params.amount = params.leaf_amount;
+        let data = build_decompress_to_spl_data(&params);
+        assert_eq!(&data[190..198], &[0u8; 8], "change = 0 when spending it all");
     }
 
     #[test]
-    fn test_build_decompress_to_spl_data_max_amount_u64() {
-        let amount = u64::MAX;
-        let data = build_decompress_to_spl_data(amount, 0);
-        let c0 = u64::from_le_bytes(data[15..23].try_into().unwrap());
-        let c1 = u64::from_le_bytes(data[31..39].try_into().unwrap());
-        assert_eq!(c0, u64::MAX, "Compression 0 handles u64::MAX");
-        assert_eq!(c1, u64::MAX, "Compression 1 handles u64::MAX");
+    fn test_amount_over_leaf_amount_saturates_change_to_zero() {
+        // Defence in depth: an over-spend must not wrap the change to ~u64::MAX
+        // and mint tokens out of thin air. The cToken rejects it via the sum
+        // check either way, but the builder must never emit that number.
+        let p = [0u8; 128];
+        let mut params = proven_params(&p);
+        params.amount = params.leaf_amount + 1;
+        let data = build_decompress_to_spl_data(&params);
+        assert_eq!(&data[190..198], &[0u8; 8], "change saturates at 0, no wrap");
     }
 
     #[test]
-    fn test_build_decompress_to_spl_data_compression0_mode_is_decompress_compression1_is_compress() {
-        let data = build_decompress_to_spl_data(1_000, 0);
-        assert_eq!(data[14], 1, "C0 mode: Decompress = 1");
-        assert_eq!(data[30], 0, "C1 mode: Compress = 0");
+    fn test_trailing_option_fields_are_none() {
+        let p = [0u8; 128];
+        let data = build_decompress_to_spl_data(&proven_params(&p));
+        assert_eq!(
+            &data[202..206],
+            &[0, 0, 0, 0],
+            "in_lamports / out_lamports / in_tlv / out_tlv = None",
+        );
     }
+
+    #[test]
+    fn test_build_decompress_to_spl_data_is_deterministic() {
+        let p = [3u8; 128];
+        let a = build_decompress_to_spl_data(&proven_params(&p));
+        let b = build_decompress_to_spl_data(&proven_params(&p));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_matches_the_proven_mainnet_bytes_exactly() {
+        // Golden test: the exact payload that simulated clean on mainnet
+        // (err: null). The proof is zeroed here since it is fetched per attempt;
+        // every other byte is pinned.
+        let p = [0u8; 128];
+        let data = build_decompress_to_spl_data(&proven_params(&p));
+        let expected_head: [u8; 30] = [
+            101, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0, 1, 1, 0, 0, 0, // header + compressions len
+            1, 0x40, 0x42, 0x0f, 0, 0, 0, 0, 0, // Decompress + amount 1_000_000 LE
+            3, 4, 0, 5, 0, 255, 6, // mint, pool_ata, auth, omnibus, pool_index, bump, decimals
+        ];
+        assert_eq!(&data[0..30], &expected_head, "header + Compression[0]");
+
+        let expected_in: [u8; 22] = [
+            2, // owner = packed[2]
+            0xc0, 0x67, 0x05, 0xeb, 0, 0, 0, 0, // leaf_amount 3_943_000_000 LE
+            0, 0, // has_delegate, delegate
+            3, 1, // mint, version=V1
+            0, 1, // mt_index, queue_index
+            0x88, 0x61, 0x93, 0x03, // leaf_index 59_990_408 LE
+            0,    // prove_by_index
+            0x62, 0x06, // root_index 1634 LE
+        ];
+        assert_eq!(&data[163..185], &expected_in, "MultiInputTokenDataWithContext");
+
+        let expected_out: [u8; 13] = [
+            2, // owner
+            0x80, 0x25, 0xf6, 0xea, 0, 0, 0, 0, // change 3_942_000_000 LE
+            0, 0, // has_delegate, delegate
+            3, 1, // mint, version
+        ];
+        assert_eq!(&data[189..202], &expected_out, "MultiTokenTransferOutputData");
+    }
+
+    // ── parse_leaf_proof_fields ──────────────────────────────────────────────
+
+    fn leaf_proof_wire() -> Vec<u8> {
+        let mut w = Vec::new();
+        w.extend_from_slice(&3_943_000_000u64.to_le_bytes()); // leaf_amount
+        w.push(1); // version
+        w.extend_from_slice(&59_990_408u32.to_le_bytes()); // leaf_index
+        w.extend_from_slice(&1634u16.to_le_bytes()); // root_index
+        w.push(0); // prove_by_index
+        w.extend_from_slice(&[9u8; 128]); // proof
+        w
+    }
+
+    #[test]
+    fn test_parse_leaf_proof_fields_roundtrips() {
+        let wire = leaf_proof_wire();
+        let (f, next) = parse_leaf_proof_fields(&wire, 0).unwrap();
+        assert_eq!(f.leaf_amount, 3_943_000_000);
+        assert_eq!(f.version, 1);
+        assert_eq!(f.leaf_index, 59_990_408);
+        assert_eq!(f.root_index, 1634);
+        assert!(!f.prove_by_index);
+        assert_eq!(f.proof, &[9u8; 128]);
+        assert_eq!(next, LEAF_PROOF_WIRE_LEN, "offset lands past the block");
+    }
+
+    #[test]
+    fn test_parse_leaf_proof_fields_honours_offset() {
+        let mut wire = vec![0xAA; 17]; // entity_id + amount + bump prefix
+        wire.extend_from_slice(&leaf_proof_wire());
+        let (f, next) = parse_leaf_proof_fields(&wire, 17).unwrap();
+        assert_eq!(f.leaf_index, 59_990_408);
+        assert_eq!(next, 17 + LEAF_PROOF_WIRE_LEN);
+    }
+
+    #[test]
+    fn test_parse_leaf_proof_fields_truncated_is_rejected() {
+        let wire = leaf_proof_wire();
+        for cut in [0usize, 8, 16, 143] {
+            assert_eq!(
+                parse_leaf_proof_fields(&wire[..cut], 0).err(),
+                Some(ProgramError::InvalidInstructionData),
+                "truncated at {cut} bytes must not parse",
+            );
+        }
+    }
+
+    #[test]
+    fn test_into_params_carries_wire_fields_and_caller_fields() {
+        let wire = leaf_proof_wire();
+        let (f, _) = parse_leaf_proof_fields(&wire, 0).unwrap();
+        let p = f.into_params(1_000_000, 255);
+        assert_eq!(p.amount, 1_000_000, "caller-owned");
+        assert_eq!(p.spl_bump, 255, "caller-owned");
+        assert_eq!(p.leaf_amount, 3_943_000_000, "from the wire");
+        assert_eq!(p.version, 1, "from the wire");
+    }
+
 
     // ── TRANSFER_V1_DISC ────────────────────────────────────────────────────
 

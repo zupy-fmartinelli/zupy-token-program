@@ -19,7 +19,7 @@ use crate::constants::{
 use crate::error::ZupyTokenError;
 use crate::helpers::compressed_accounts::{
     build_metas_forcing_signer, cpi_decompress_to_spl, derive_spl_interface_pda,
-    validate_v1_transfer_disc,
+    parse_leaf_proof_fields, validate_v1_transfer_disc, DecompressToSplAccounts,
 };
 use crate::helpers::instruction_data::{parse_string, parse_u64, parse_u8};
 use crate::helpers::memo::validate_memo_format;
@@ -29,11 +29,11 @@ use crate::state::token_state::TokenState;
 
 /// V2 decompress path: compressed PDA balance → pool ATA via Light Transfer2.
 ///
-/// Accounts (11 minimum):
+/// Accounts (17):
 ///   0. transfer_authority        (signer)
 ///   1. token_state               (read)
 ///   2. mint                      (read)
-///   3. entity_pda                (read)           — company or user PDA
+///   3. entity_pda                (read)           — company or user PDA (leaf owner)
 ///   4. pool_ata                  (writable)
 ///   5. fee_payer                 (writable, signer)
 ///   6. token_program             (read)
@@ -41,9 +41,20 @@ use crate::state::token_state::TokenState;
 ///   8. compressed_token_program  (read)
 ///   9. compressed_token_authority (read)
 ///   10. spl_interface_pda        (writable)
-///   11+ Light system accounts
+///   11. light_system_program     (read)
+///   12. registered_program_pda   (read)
+///   13. account_compression_authority (read)
+///   14. account_compression_program   (read)
+///   15. merkle_tree              (writable)
+///   16. output_queue             (writable)
 ///
-/// Data: entity_id (0-7) + amount (8-15) + entity_bump (16) + memo (17+)
+/// Data: entity_id (0-7) + amount (8-15) + entity_bump (16)
+///       + leaf/proof block (17..161, see `LEAF_PROOF_WIRE_LEN`) + memo (161+)
+///
+/// The Light accounts (11-16) used to be an open-ended `accounts[11..]` tail that
+/// the client assembled. They are named now because declaring `in_token_data`
+/// routes the cToken through the light-system program, whose account prefix is
+/// fixed and position-sensitive — an anonymous tail cannot be validated.
 /// Validate the entity PDA (client bump) + the pool ATA (address matches
 /// token_state, owned by Token-2022). Shared by the decompress + V1-passthrough
 /// return-to-pool paths (dedup).
@@ -76,8 +87,8 @@ pub fn decompress_to_pool(
     data: &[u8],
     pda_seed: &[u8],
 ) -> ProgramResult {
-    // ── Account extraction (11 accounts minimum) ─────────────────────────
-    if accounts.len() < 11 {
+    // ── Account extraction (17 accounts) ─────────────────────────────────
+    if accounts.len() < 17 {
         return Err(ProgramError::NotEnoughAccountKeys);
     }
     let transfer_authority = &accounts[0];
@@ -91,12 +102,19 @@ pub fn decompress_to_pool(
     let compressed_token_prog = &accounts[8];
     let compressed_token_auth = &accounts[9];
     let spl_interface_pda = &accounts[10];
+    let light_system_program = &accounts[11];
+    let registered_program_pda = &accounts[12];
+    let account_compression_authority = &accounts[13];
+    let account_compression_program = &accounts[14];
+    let merkle_tree = &accounts[15];
+    let output_queue = &accounts[16];
 
     // ── Parse instruction data ──────────────────────────────────────────
     let entity_id_u64 = parse_u64(data, 0)?;
     let amount = parse_u64(data, 8)?;
     let entity_bump = parse_u8(data, 16)?;
-    let (memo, _) = parse_string(data, 17)?;
+    let (leaf_fields, memo_offset) = parse_leaf_proof_fields(data, 17)?;
+    let (memo, _) = parse_string(data, memo_offset)?;
 
     // ── Input validation ────────────────────────────────────────────────
     if amount == 0 {
@@ -161,18 +179,23 @@ pub fn decompress_to_pool(
     let signer = Signer::from(&signer_seeds);
 
     cpi_decompress_to_spl(
-        compressed_token_prog,
-        compressed_token_auth,
-        fee_payer,
-        mint,
-        pool_ata,
-        entity_pda,
-        spl_interface_pda,
-        token_program,
-        system_program,
-        amount,
-        spl_bump,
-        &accounts[11..],
+        &DecompressToSplAccounts {
+            light_system_program,
+            payer: fee_payer,
+            compressed_token_authority: compressed_token_auth,
+            registered_program_pda,
+            account_compression_authority,
+            account_compression_program,
+            system_program,
+            merkle_tree,
+            output_queue,
+            authority: entity_pda,
+            mint,
+            destination_spl: pool_ata,
+            spl_interface_pda,
+            spl_token_program: token_program,
+        },
+        &leaf_fields.into_params(amount, spl_bump),
         &[signer],
     )?;
 
