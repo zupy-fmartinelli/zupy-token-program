@@ -1,0 +1,119 @@
+name: Tests
+
+# Por que este workflow existe (2026-08-22):
+#
+# O único comando cargo em todo o CI era `cargo llvm-cov --lib` no sonarqube.yml.
+# `--lib` roda SÓ os testes unitários. Os 68 testes de integração
+# (test_transfers, test_cu_benchmarks, test_split_burns, test_entrypoint) NUNCA
+# eram executados, e `cargo clippy` nunca rodava — apesar de o sonarqube.yml
+# instalar o componente clippy e não usá-lo.
+#
+# Consequência medida: o fix do cToken 6005 (2e193f4, julho) deixou 17 fixtures
+# apontando para o contrato antigo, e outras 9 já estavam vermelhas antes dele.
+# Nada disso apareceu. Teste que não roda é teste que não existe.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Baseline do clippy em código de TESTE. Ver o passo "Clippy (test code)".
+  CLIPPY_TEST_ERROR_BASELINE: 3
+
+jobs:
+  test:
+    name: Build SBF + Suíte completa + Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-tests-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-tests-
+
+      - name: Install Solana CLI (fornece o cargo build-sbf)
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+
+      # O binário de mainnet é o artefato que vai on-chain. Compilar sem
+      # --features mainnet embarca os limites de devnet: DAILY_MINT_LIMIT 100x
+      # maior e PER_TX_MINT_LIMIT 200x maior. Ver constants.rs.
+      - name: Build SBF (mainnet)
+        run: cargo build-sbf --no-default-features --features mainnet
+
+      # Clippy no CÓDIGO DO PROGRAMA — o que roda on-chain. Bloqueante, e hoje
+      # está limpo (0 erros). Qualquer erro novo aqui reprova.
+      - name: Clippy (program code)
+        run: cargo clippy --lib
+
+      # Clippy em código de TESTE. Ratchet por contagem: hoje há 3 erros, todos
+      # `assertions_on_constants`/`absurd_extreme_comparisons` -- asserts que não
+      # asseguram nada (`bump <= 255` num u8 é sempre verdadeiro), em
+      # constants.rs:203 e compressed_accounts.rs:992. Consertar exige decidir o
+      # que a asserção DEVERIA provar, então fica registrado em vez de escondido.
+      # Falha se subir (regressão) E se cair (baseline obsoleto — atualize-o).
+      - name: Clippy (test code, ratchet)
+        run: |
+          set -o pipefail
+          count=$(cargo clippy --all-targets --message-format=short 2>&1 \
+                  | grep -cE '^[^ ]+:[0-9]+:[0-9]+: error' || true)
+          echo "erros de clippy em código de teste: $count (baseline: $CLIPPY_TEST_ERROR_BASELINE)"
+          if [ "$count" -gt "$CLIPPY_TEST_ERROR_BASELINE" ]; then
+            echo "::error::Clippy regrediu: $count erros, baseline $CLIPPY_TEST_ERROR_BASELINE."
+            cargo clippy --all-targets 2>&1 | grep -A6 '^error' || true
+            exit 1
+          fi
+          if [ "$count" -lt "$CLIPPY_TEST_ERROR_BASELINE" ]; then
+            echo "::error::Baseline obsoleto: só $count erros. Baixe CLIPPY_TEST_ERROR_BASELINE para $count."
+            exit 1
+          fi
+
+      # SBF_OUT_DIR é obrigatório: o mollusk carrega o .so compilado para simular
+      # a VM da Solana. Sem ele, 21 testes falham com "Program file not found" e
+      # o cargo aborta no primeiro binário vermelho, escondendo os seguintes.
+      - name: Suíte completa
+        id: suite
+        run: |
+          set -o pipefail
+          SBF_OUT_DIR=target/deploy cargo test --no-fail-fast 2>&1 | tee test-output.txt || true
+
+      # Allowlist em vez de pass-rate: nomear o que está quebrado pega regressão
+      # nova NA HORA, e obriga quem consertar a remover a entrada (GR21/GR3).
+      - name: Gate — falhas conhecidas vs novas
+        run: |
+          grep -oE '^    [a-z_]+::[a-z_]+|^    test_[a-z_]+' test-output.txt \
+            | sed 's/^    //' | sort -u > falhas-atuais.txt
+          grep -vE '^\s*(#|$)' .github/known-test-failures.txt | sort -u > falhas-conhecidas.txt
+
+          novas=$(comm -23 falhas-atuais.txt falhas-conhecidas.txt)
+          corrigidas=$(comm -13 falhas-atuais.txt falhas-conhecidas.txt)
+
+          status=0
+          if [ -n "$novas" ]; then
+            echo "::error::REGRESSÃO — testes que passavam agora falham:"
+            echo "$novas" | sed 's/^/  /'
+            status=1
+          fi
+          if [ -n "$corrigidas" ]; then
+            echo "::error::Entradas OBSOLETAS em .github/known-test-failures.txt (estes testes passam agora — remova-os):"
+            echo "$corrigidas" | sed 's/^/  /'
+            status=1
+          fi
+          [ $status -eq 0 ] && echo "OK — $(wc -l < falhas-atuais.txt) falhas, todas conhecidas e ainda vermelhas."
+          exit $status

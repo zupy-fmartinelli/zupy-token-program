@@ -1,0 +1,27 @@
+# Testes que JÁ falhavam quando o gate de CI foi criado (2026-08-22).
+#
+# Isto é um ratchet, não uma isenção. O CI falha se:
+#   - qualquer teste FORA desta lista falhar   → regressão nova
+#   - qualquer teste DESTA lista passar        → entrada obsoleta, remova-a
+#
+# A segunda regra é o que impede a lista de virar lixeira: quem consertar um
+# teste é obrigado a tirá-lo daqui no mesmo commit.
+#
+# ── Por que estes 9 estão vermelhos ──────────────────────────────────────────
+# Todos em transfer_company_to_user, todos com InvalidInstructionData. É drift
+# de wire ANTERIOR ao fix do cToken 6005 (medido: já falhavam em 2146b35, o
+# commit de release imediatamente anterior ao fix). Escopo próprio, ainda não
+# diagnosticado.
+#
+# Ficaram invisíveis porque o CI só rodava `cargo llvm-cov --lib` — os testes
+# de integração nunca eram executados. Este workflow existe para fechar isso.
+
+transfer_company_to_user::test_invalid_memo
+transfer_company_to_user::test_invalid_token_program
+transfer_company_to_user::test_not_enough_accounts
+transfer_company_to_user::test_not_initialized
+transfer_company_to_user::test_system_paused
+transfer_company_to_user::test_wrong_company_pda
+transfer_company_to_user::test_wrong_transfer_authority
+transfer_company_to_user::test_wrong_user_pda
+transfer_company_to_user::test_zero_amount
