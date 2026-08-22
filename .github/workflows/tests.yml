@@ -51,11 +51,16 @@ jobs:
           sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
           echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
 
-      # O binário de mainnet é o artefato que vai on-chain. Compilar sem
-      # --features mainnet embarca os limites de devnet: DAILY_MINT_LIMIT 100x
-      # maior e PER_TX_MINT_LIMIT 200x maior. Ver constants.rs.
-      - name: Build SBF (mainnet)
-        run: cargo build-sbf --no-default-features --features mainnet
+      # O clippy só emite diagnóstico para o que ele REANALISA. Com o cache
+      # restaurado ele não recompila o crate e reporta ZERO — sem erro, sem
+      # aviso, sem sinal de que não olhou. Limpa só o nosso crate; as
+      # dependências seguem em cache.
+      #
+      # (Isto NÃO foi o que derrubou a primeira rodada, 498e83a — ver o passo
+      # do ratchet abaixo. A hipótese do cache foi testada e refutada: local,
+      # com e sem clean, a contagem deu 3 nas duas vezes.)
+      - name: Invalidar cache do clippy para o nosso crate
+        run: cargo clean -p zupy-token-program
 
       # Clippy no CÓDIGO DO PROGRAMA — o que roda on-chain. Bloqueante, e hoje
       # está limpo (0 erros). Qualquer erro novo aqui reprova.
@@ -68,21 +73,38 @@ jobs:
       # constants.rs:203 e compressed_accounts.rs:992. Consertar exige decidir o
       # que a asserção DEVERIA provar, então fica registrado em vez de escondido.
       # Falha se subir (regressão) E se cair (baseline obsoleto — atualize-o).
+      #
+      # 🔴 `--color never` é OBRIGATÓRIO, e foi o que derrubou a primeira rodada
+      # (498e83a): o `CARGO_TERM_COLOR: always` do env acima embrulha a palavra
+      # `error` em escapes ANSI —
+      #     src/constants.rs:203:17: \e[1m\e[91merror\e[0m: this comparison...
+      # — e o grep por `: error` literal não casa NADA. O gate contou 0 onde
+      # havia 3, e o único sintoma foi "baseline obsoleto". Medido nos dois
+      # modos: sem cor 3, com cor 0.
       - name: Clippy (test code, ratchet)
         run: |
           set -o pipefail
-          count=$(cargo clippy --all-targets --message-format=short 2>&1 \
+          count=$(cargo clippy --all-targets --color never --message-format=short 2>&1 \
                   | grep -cE '^[^ ]+:[0-9]+:[0-9]+: error' || true)
           echo "erros de clippy em código de teste: $count (baseline: $CLIPPY_TEST_ERROR_BASELINE)"
           if [ "$count" -gt "$CLIPPY_TEST_ERROR_BASELINE" ]; then
             echo "::error::Clippy regrediu: $count erros, baseline $CLIPPY_TEST_ERROR_BASELINE."
-            cargo clippy --all-targets 2>&1 | grep -A6 '^error' || true
+            cargo clippy --all-targets --color never 2>&1 | grep -A6 '^error' || true
             exit 1
           fi
           if [ "$count" -lt "$CLIPPY_TEST_ERROR_BASELINE" ]; then
             echo "::error::Baseline obsoleto: só $count erros. Baixe CLIPPY_TEST_ERROR_BASELINE para $count."
             exit 1
           fi
+
+      # Build DEPOIS do clippy: o `cargo clean -p` acima apaga os artefatos do
+      # crate, e a suíte precisa do .so vivo em target/deploy.
+      #
+      # O binário de mainnet é o artefato que vai on-chain. Compilar sem
+      # --features mainnet embarca os limites de devnet: DAILY_MINT_LIMIT 100x
+      # maior e PER_TX_MINT_LIMIT 200x maior. Ver constants.rs.
+      - name: Build SBF (mainnet)
+        run: cargo build-sbf --no-default-features --features mainnet
 
       # SBF_OUT_DIR é obrigatório: o mollusk carrega o .so compilado para simular
       # a VM da Solana. Sem ele, 21 testes falham com "Program file not found" e
