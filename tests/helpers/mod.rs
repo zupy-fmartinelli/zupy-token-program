@@ -311,6 +311,22 @@ pub fn build_ix_data(disc: &[u8; 8], payload: &[u8]) -> Vec<u8> {
     data
 }
 
+/// Merkle tree das fixtures de decompress (conta 15 em `return_to_pool`, 17 em
+/// `withdraw_to_external`).
+///
+/// Valor FIXO, nunca `Pubkey::new_unique()`: `build_accounts` e `build_ix_metas` são
+/// funções separadas, e um pubkey aleatório em cada uma faria a mesma posição divergir
+/// entre a lista de metas e a de contas. O teste falharia por conta inexistente — não
+/// pelo que ele existe para provar.
+pub fn test_merkle_tree_id() -> Pubkey {
+    Pubkey::new_from_array([0x11; 32])
+}
+
+/// Output queue das fixtures de decompress (conta 16 / 18). Fixo, mesmo motivo.
+pub fn test_output_queue_id() -> Pubkey {
+    Pubkey::new_from_array([0x22; 32])
+}
+
 /// Build the leaf + validity-proof block that every decompress instruction carries.
 ///
 /// Layout (`LEAF_PROOF_WIRE_LEN` = 144 bytes), parsed by `parse_leaf_proof_fields`

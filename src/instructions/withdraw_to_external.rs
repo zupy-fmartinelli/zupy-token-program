@@ -196,13 +196,16 @@ pub fn process(
 mod tests {
     use super::*;
 
-    /// Verify new account count check: at least 13 accounts required.
-    /// Passing zero accounts (or any count < 13) must return NotEnoughAccountKeys.
+    /// Verify the account count check: at least 19 accounts required.
+    /// Passing zero accounts (or any count < 19) must return NotEnoughAccountKeys.
+    ///
+    /// Era 13 ate o fix do cToken 6005: as contas do Light iam como cauda anonima
+    /// `accounts[13..]`. Agora sao 6 contas NOMEADAS (13-18), validadas uma a uma.
     #[test]
     fn test_process_returns_not_enough_account_keys() {
         let program_id = Address::default();
         let data = [0u8; 17];
-        // Empty slice — account count check fires immediately (accounts.len() < 13)
+        // Empty slice — account count check fires immediately (accounts.len() < 19)
         let result = process(&program_id, &[], &data);
         assert_eq!(result, Err(ProgramError::NotEnoughAccountKeys));
     }

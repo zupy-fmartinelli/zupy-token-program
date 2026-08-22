@@ -401,7 +401,12 @@ mod transfer_from_pool {
 mod return_to_pool {
     use super::*;
 
-    /// Build the 11-account set for return_to_pool (compressed layout).
+    /// Build the 17-account set for return_to_pool (compressed layout).
+    ///
+    /// Eram 11 até o fix do cToken 6005: as contas do Light iam como cauda anônima
+    /// `accounts[11..]`, repassada às cegas. Agora são NOMEADAS (11-16) e validadas
+    /// uma a uma — declarar `in_token_data` roteia a chamada pelo light-system, cujo
+    /// prefixo de contas é outro, e prefixo posicional não se valida às cegas.
     pub(super) fn build_accounts(
         transfer_auth: &Pubkey,
         token_state_pda: &Pubkey,
@@ -449,6 +454,13 @@ mod return_to_pool {
             (ctoken_auth, make_system_account(1_000_000)),
             // 10: spl_interface_pda (writable)
             (spl_pda, make_system_account(1_000_000)),
+            // 11-16: contas do light-system, nomeadas desde o fix do 6005
+            make_program_stub(&light_system_program_id()),
+            (registered_program_pda_id(), make_system_account(1_000_000)),
+            (account_compression_authority_id(), make_system_account(1_000_000)),
+            make_program_stub(&account_compression_program_id()),
+            (test_merkle_tree_id(), make_system_account(1_000_000)),
+            (test_output_queue_id(), make_system_account(1_000_000)),
         ]
     }
 
@@ -475,6 +487,12 @@ mod return_to_pool {
             AccountMeta::new_readonly(ctoken_prog, false),              // 8: ctoken program
             AccountMeta::new_readonly(ctoken_auth, false),              // 9: ctoken authority
             AccountMeta::new(spl_pda, false),                           // 10: spl_interface_pda
+            AccountMeta::new_readonly(light_system_program_id(), false), // 11
+            AccountMeta::new_readonly(registered_program_pda_id(), false), // 12
+            AccountMeta::new_readonly(account_compression_authority_id(), false), // 13
+            AccountMeta::new_readonly(account_compression_program_id(), false), // 14
+            AccountMeta::new(test_merkle_tree_id(), false),             // 15: writable
+            AccountMeta::new(test_output_queue_id(), false),            // 16: writable
         ]
     }
 
@@ -523,6 +541,7 @@ mod return_to_pool {
         payload.extend_from_slice(&company_id.to_le_bytes());
         payload.extend_from_slice(&amount.to_le_bytes());
         payload.push(company_bump);
+        payload.extend_from_slice(&build_leaf_proof_wire()); // offset 17, 144 bytes
         payload.extend_from_slice(&memo);
         let data = build_ix_data(&DISC_RETURN_TO_POOL, &payload);
 
@@ -555,6 +574,7 @@ mod return_to_pool {
         payload.extend_from_slice(&company_id.to_le_bytes());
         payload.extend_from_slice(&amount.to_le_bytes());
         payload.push(company_bump);
+        payload.extend_from_slice(&build_leaf_proof_wire()); // offset 17, 144 bytes
         payload.extend_from_slice(&memo);
         let data = build_ix_data(&DISC_RETURN_TO_POOL, &payload);
 
@@ -587,26 +607,16 @@ mod return_to_pool {
         payload.extend_from_slice(&company_id.to_le_bytes());
         payload.extend_from_slice(&amount.to_le_bytes());
         payload.push(company_bump);
+        payload.extend_from_slice(&build_leaf_proof_wire()); // offset 17, 144 bytes
         payload.extend_from_slice(&memo);
         let data = build_ix_data(&DISC_RETURN_TO_POOL, &payload);
 
-        let ctoken_prog = ctoken_program_id();
-        let ctoken_auth = derive_ctoken_authority();
-        let spl_pda = derive_spl_interface_pda(&mint);
-        // fee_payer passed as non-signer (false)
-        let metas = vec![
-            AccountMeta::new(transfer_auth, true),
-            AccountMeta::new_readonly(token_state_pda, false),
-            AccountMeta::new_readonly(mint, false),
-            AccountMeta::new_readonly(company_pda, false),
-            AccountMeta::new(pool_ata, false),
-            AccountMeta::new(fee_payer, false), // NOT signer
-            AccountMeta::new_readonly(token_2022_id(), false),
-            AccountMeta::new_readonly(system_program_id(), false),
-            AccountMeta::new_readonly(ctoken_prog, false),
-            AccountMeta::new_readonly(ctoken_auth, false),
-            AccountMeta::new(spl_pda, false),
-        ];
+        // Reusa o builder e sobrescreve só a conta sob teste (GR3) — antes esta lista
+        // era escrita à mão e ficou com as 11 contas antigas quando o layout virou 17,
+        // então o teste morria em NotEnoughAccountKeys sem chegar no check de signer.
+        // Mesmo padrão do `test_fee_payer_not_signer` de transfer_from_pool.
+        let mut metas = build_ix_metas(&transfer_auth, &token_state_pda, &mint, &company_pda, &pool_ata, &fee_payer);
+        metas[5] = AccountMeta::new(fee_payer, false); // NOT signer
         let instruction = Instruction::new_with_bytes(program_id(), &data, metas);
         let accounts = build_accounts(&transfer_auth, &token_state_pda, ts_data, &mint, &company_pda, &pool_ata, &fee_payer);
 
@@ -1638,26 +1648,17 @@ fn test_wrong_token_program_return_to_pool() {
     payload.extend_from_slice(&company_id.to_le_bytes());
     payload.extend_from_slice(&amount.to_le_bytes());
     payload.push(company_bump);
+    payload.extend_from_slice(&build_leaf_proof_wire()); // offset 17, 144 bytes
     payload.extend_from_slice(&memo);
     let data = build_ix_data(&DISC_RETURN_TO_POOL, &payload);
 
     let wrong_token_program = Pubkey::new_unique();
-    let ctoken_prog = ctoken_program_id();
-    let ctoken_auth = derive_ctoken_authority();
-    let spl_pda = derive_spl_interface_pda(&mint);
-    let metas = vec![
-        AccountMeta::new(transfer_auth, true),
-        AccountMeta::new_readonly(token_state_pda, false),
-        AccountMeta::new_readonly(mint, false),
-        AccountMeta::new_readonly(company_pda, false),
-        AccountMeta::new(pool_ata, false),
-        AccountMeta::new(fee_payer, true),
-        AccountMeta::new_readonly(wrong_token_program, false), // idx 6: WRONG
-        AccountMeta::new_readonly(system_program_id(), false),
-        AccountMeta::new_readonly(ctoken_prog, false),
-        AccountMeta::new_readonly(ctoken_auth, false),
-        AccountMeta::new(spl_pda, false),
-    ];
+    // Reusa o builder e sobrescreve só a conta sob teste (GR3) — a lista escrita à mão
+    // ficou com as 11 contas antigas quando o layout virou 17.
+    let mut metas = return_to_pool::build_ix_metas(
+        &transfer_auth, &token_state_pda, &mint, &company_pda, &pool_ata, &fee_payer,
+    );
+    metas[6] = AccountMeta::new_readonly(wrong_token_program, false); // idx 6: WRONG
     let instruction = Instruction::new_with_bytes(program_id(), &data, metas);
 
     let mut accounts = return_to_pool::build_accounts(
@@ -1796,6 +1797,14 @@ mod withdraw_to_external {
             (ctoken_auth, make_system_account(1_000_000)),
             // 12: spl_interface_pda (writable)
             (spl_pda, make_system_account(1_000_000)),
+            // 13-18: contas do light-system, nomeadas desde o fix do 6005 (eram a
+            // cauda anônima `accounts[13..]`, repassada sem validação)
+            make_program_stub(&light_system_program_id()),
+            (registered_program_pda_id(), make_system_account(1_000_000)),
+            (account_compression_authority_id(), make_system_account(1_000_000)),
+            make_program_stub(&account_compression_program_id()),
+            (test_merkle_tree_id(), make_system_account(1_000_000)),
+            (test_output_queue_id(), make_system_account(1_000_000)),
         ]
     }
 
@@ -1825,6 +1834,12 @@ mod withdraw_to_external {
             AccountMeta::new_readonly(ctoken_program_id(), false), // 10
             AccountMeta::new_readonly(ctoken_auth, false),         // 11
             AccountMeta::new(spl_pda, false),                      // 12: writable
+            AccountMeta::new_readonly(light_system_program_id(), false), // 13
+            AccountMeta::new_readonly(registered_program_pda_id(), false), // 14
+            AccountMeta::new_readonly(account_compression_authority_id(), false), // 15
+            AccountMeta::new_readonly(account_compression_program_id(), false), // 16
+            AccountMeta::new(test_merkle_tree_id(), false),        // 17: writable
+            AccountMeta::new(test_output_queue_id(), false),       // 18: writable
         ]
     }
 
@@ -1836,6 +1851,7 @@ mod withdraw_to_external {
         payload.extend_from_slice(&amount.to_le_bytes());
         payload.extend_from_slice(&user_id.to_le_bytes());
         payload.push(user_bump);
+        payload.extend_from_slice(&build_leaf_proof_wire()); // offset 17, 144 bytes
         payload.extend_from_slice(&memo_bytes);
         payload
     }
@@ -2344,21 +2360,12 @@ mod withdraw_to_external {
         let ctoken_auth = derive_ctoken_authority();
         let spl_pda = derive_spl_interface_pda(&mint);
         // fee_payer at idx 6 declared as non-signer → triggers fee_payer.is_signer() check
-        let metas = vec![
-            AccountMeta::new(transfer_auth, true),                 // 0: signer
-            AccountMeta::new_readonly(token_state_pda, false),     // 1: read
-            AccountMeta::new_readonly(mint, false),                // 2: read
-            AccountMeta::new_readonly(user_pda, false),            // 3: read
-            AccountMeta::new_readonly(dest_wallet, false),         // 4: read
-            AccountMeta::new(dest_ata, false),                     // 5: writable
-            AccountMeta::new(fee_payer, false),                    // 6: NOT signer
-            AccountMeta::new_readonly(token_2022_id(), false),     // 7
-            AccountMeta::new_readonly(ata_program_id(), false),    // 8
-            AccountMeta::new_readonly(system_program_id(), false), // 9
-            AccountMeta::new_readonly(ctoken_program_id(), false), // 10
-            AccountMeta::new_readonly(ctoken_auth, false),         // 11
-            AccountMeta::new(spl_pda, false),                      // 12
-        ];
+        // Reusa o builder e sobrescreve só a conta sob teste (GR3) — a lista à mão
+        // ficou com as 13 contas antigas quando o layout virou 19.
+        let mut metas = build_ix_metas(
+            &transfer_auth, &token_state_pda, &mint, &user_pda, &dest_wallet, &dest_ata, &fee_payer,
+        );
+        metas[6] = AccountMeta::new(fee_payer, false); // 6: NOT signer
         let instruction = Instruction::new_with_bytes(program_id(), &data, metas);
         let accounts = build_accounts(
             &transfer_auth, &token_state_pda, ts_data, &mint,
@@ -2414,6 +2421,13 @@ mod withdraw_to_external {
             AccountMeta::new_readonly(wrong_ctoken_prog, false),   // 10: WRONG ctoken program
             AccountMeta::new_readonly(ctoken_auth, false),         // 11
             AccountMeta::new(spl_pda, false),                      // 12
+            // 13-18: light-system, obrigatórias desde o fix do 6005
+            AccountMeta::new_readonly(light_system_program_id(), false),
+            AccountMeta::new_readonly(registered_program_pda_id(), false),
+            AccountMeta::new_readonly(account_compression_authority_id(), false),
+            AccountMeta::new_readonly(account_compression_program_id(), false),
+            AccountMeta::new(test_merkle_tree_id(), false),
+            AccountMeta::new(test_output_queue_id(), false),
         ];
         let instruction = Instruction::new_with_bytes(program_id(), &data, metas);
 
@@ -2476,6 +2490,13 @@ mod withdraw_to_external {
             AccountMeta::new_readonly(ctoken_program_id(), false), // 10: correct ctoken program
             AccountMeta::new_readonly(ctoken_auth, false),         // 11
             AccountMeta::new(wrong_spl_pda, false),                // 12: WRONG spl_interface_pda
+            // 13-18: light-system, obrigatórias desde o fix do 6005
+            AccountMeta::new_readonly(light_system_program_id(), false),
+            AccountMeta::new_readonly(registered_program_pda_id(), false),
+            AccountMeta::new_readonly(account_compression_authority_id(), false),
+            AccountMeta::new_readonly(account_compression_program_id(), false),
+            AccountMeta::new(test_merkle_tree_id(), false),
+            AccountMeta::new(test_output_queue_id(), false),
         ];
         let instruction = Instruction::new_with_bytes(program_id(), &data, metas);
 
