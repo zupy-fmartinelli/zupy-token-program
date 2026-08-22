@@ -1236,7 +1236,12 @@ fn test_cu_error_paths() {
         assert!(result.compute_units_consumed < MAX_CU_TRANSFER_FROM_POOL);
     }
 
-    // return_to_pool: wrong PDA (compressed 11-account layout)
+    // return_to_pool: wrong PDA (compressed 17-account layout)
+    //
+    // A fixture ficou parada no contrato antigo (11 contas, memo no offset 17) e o
+    // programa passou a abortar em NotEnoughAccountKeys ANTES de chegar na validação
+    // de PDA — o teste passava a medir a coisa errada. Reconciliada com a wire do fix
+    // do cToken 6005 (GR23): 17 contas + bloco leaf/proof antes do memo.
     {
         let (token_state_pda, bump) = derive_token_state_pda();
         let transfer_auth = Pubkey::new_unique();
@@ -1256,8 +1261,11 @@ fn test_cu_error_paths() {
         payload.extend_from_slice(&company_id.to_le_bytes());
         payload.extend_from_slice(&amount.to_le_bytes());
         payload.push(company_bump);
+        payload.extend_from_slice(&build_leaf_proof_wire()); // offset 17, 144 bytes
         payload.extend_from_slice(&memo);
         let data = build_ix_data(&DISC_RETURN_TO_POOL, &payload);
+        let merkle_tree = Pubkey::new_unique();
+        let output_queue = Pubkey::new_unique();
         let metas = vec![
             AccountMeta::new(transfer_auth, true),              // 0: signer
             AccountMeta::new_readonly(token_state_pda, false),  // 1
@@ -1270,6 +1278,13 @@ fn test_cu_error_paths() {
             AccountMeta::new_readonly(ctoken_prog, false),      // 8
             AccountMeta::new_readonly(ctoken_auth, false),      // 9
             AccountMeta::new(spl_pda, false),                   // 10: writable
+            // — 11-16: contas do light-system, nomeadas desde o fix do 6005 —
+            AccountMeta::new_readonly(light_system_program_id(), false), // 11
+            AccountMeta::new_readonly(registered_program_pda_id(), false), // 12
+            AccountMeta::new_readonly(account_compression_authority_id(), false), // 13
+            AccountMeta::new_readonly(account_compression_program_id(), false), // 14
+            AccountMeta::new(merkle_tree, false),               // 15: writable
+            AccountMeta::new(output_queue, false),              // 16: writable
         ];
         let accounts = vec![
             (transfer_auth, make_system_account(1_000_000)),
@@ -1283,6 +1298,12 @@ fn test_cu_error_paths() {
             make_program_stub(&ctoken_prog),
             (ctoken_auth, make_system_account(1_000_000)),
             (spl_pda, make_system_account(1_000_000)),
+            make_program_stub(&light_system_program_id()),
+            (registered_program_pda_id(), make_system_account(1_000_000)),
+            (account_compression_authority_id(), make_system_account(1_000_000)),
+            make_program_stub(&account_compression_program_id()),
+            (merkle_tree, make_system_account(1_000_000)),
+            (output_queue, make_system_account(1_000_000)),
         ];
         let ix = Instruction::new_with_bytes(program_id(), &data, metas);
         let result = run_benchmark(&mollusk, &ix, &accounts);

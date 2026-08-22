@@ -311,6 +311,27 @@ pub fn build_ix_data(disc: &[u8; 8], payload: &[u8]) -> Vec<u8> {
     data
 }
 
+/// Build the leaf + validity-proof block that every decompress instruction carries.
+///
+/// Layout (`LEAF_PROOF_WIRE_LEN` = 144 bytes), parsed by `parse_leaf_proof_fields`
+/// at offset 17 of the payload:
+/// `leaf_amount(8) + version(1) + leaf_index(4) + root_index(2) + prove_by_index(1) + proof(128)`
+///
+/// Introduced by the cToken 6005 fix (`2e193f4`): before it, `return_to_pool`,
+/// `return_user_to_pool` and `withdraw_to_external` carried no leaf at all and the
+/// memo sat at offset 17. A payload without this block now fails to parse long
+/// before reaching the validation under test.
+pub fn build_leaf_proof_wire() -> Vec<u8> {
+    let mut buf = Vec::with_capacity(144);
+    buf.extend_from_slice(&3_943_000_000u64.to_le_bytes()); // leaf_amount
+    buf.push(1); // version — vem do leaf (V1=1); hardcodar 2 numa leaf V1 dá 6043
+    buf.extend_from_slice(&59_990_408u32.to_le_bytes()); // leaf_index
+    buf.extend_from_slice(&1634u16.to_le_bytes()); // root_index
+    buf.push(0); // prove_by_index
+    buf.extend_from_slice(&[9u8; 128]); // proof
+    buf
+}
+
 /// Build a length-prefixed string (4-byte LE length + UTF-8).
 pub fn build_string(s: &str) -> Vec<u8> {
     let len = s.len() as u32;
