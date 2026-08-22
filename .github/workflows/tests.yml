@@ -87,11 +87,26 @@ jobs:
       # SBF_OUT_DIR é obrigatório: o mollusk carrega o .so compilado para simular
       # a VM da Solana. Sem ele, 21 testes falham com "Program file not found" e
       # o cargo aborta no primeiro binário vermelho, escondendo os seguintes.
+      #
+      # --test-threads=1 NÃO é preferência de estilo, é o conserto de um flake
+      # medido em 2026-08-22: `Pubkey::new_unique()` é um contador GLOBAL, então
+      # em paralelo cada teste sorteia endereços diferentes a cada execução.
+      # Endereço diferente => bump canônico diferente => número diferente de
+      # iterações dentro de find_program_address => CU diferente. Um dos
+      # benchmarks fica perto o bastante do teto para cruzá-lo às vezes:
+      # medido 21/21 em duas rodadas e 20/1 na terceira, mesmo binário e mesmo
+      # .so; sozinho, 10.675 CU estáveis em 15 rodadas; com --test-threads=1,
+      # 12/12 verdes. CI que pisca ensina a ignorar vermelho.
+      #
+      # ⚠️ Isto remove a NÃO-DETERMINAÇÃO, não a fragilidade: um benchmark cujo
+      # CU depende de qual endereço aleatório ele sorteou está medindo algo que
+      # não pretende medir. O conserto durável é pubkey FIXO nas fixtures de
+      # benchmark, como já se fez em test_merkle_tree_id().
       - name: Suíte completa
         id: suite
         run: |
           set -o pipefail
-          SBF_OUT_DIR=target/deploy cargo test --no-fail-fast 2>&1 | tee test-output.txt || true
+          SBF_OUT_DIR=target/deploy cargo test --no-fail-fast -- --test-threads=1 2>&1 | tee test-output.txt || true
 
       # Allowlist em vez de pass-rate: nomear o que está quebrado pega regressão
       # nova NA HORA, e obriga quem consertar a remover a entrada (GR21/GR3).

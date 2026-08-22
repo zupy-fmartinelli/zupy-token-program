@@ -68,6 +68,7 @@ use pinocchio::error::ProgramError;
 use pinocchio::instruction::{InstructionAccount, InstructionView};
 
 use crate::constants::{LIGHT_COMPRESSED_TOKEN_PROGRAM_ID, TOKEN_DECIMALS};
+use crate::error::ZupyTokenError;
 use crate::helpers::instruction_data::{parse_bool, parse_bytes, parse_u16, parse_u32, parse_u64, parse_u8};
 
 /// Append each remaining account as an `InstructionAccount` meta, preserving its
@@ -600,12 +601,31 @@ pub struct DecompressToSplAccounts<'a> {
 /// The entity PDA's role changed but its signature did not: it used to be the
 /// `source` of a `Compress`, it is now the owner of the input leaf, still marked
 /// `readonly_signer` and still signed for with the same `[seed, id, bump]` seeds.
+/// Rejeita cedo, por 1 CU, o que o sum check do cToken rejeitaria por ~211k.
+///
+/// O troco vai para a wire como `leaf_amount.saturating_sub(amount)`. Quando
+/// `amount > leaf_amount` a subtração **satura em 0** em vez de estourar, e a
+/// instrução sai montada e aparentemente sadia: o sum check
+/// `+leaf_amount − amount − troco` fica negativo e quem reprova é a chain, com
+/// um erro da família do cToken — a mesma classe de erro opaco que deixou o
+/// `return_to_pool` quatro meses parado. Um `>` aqui custa uma comparação.
+///
+/// `amount == leaf_amount` é legítimo: gasta a folha inteira, troco zero.
+#[inline]
+pub(crate) fn validate_decompress_amounts(leaf_amount: u64, amount: u64) -> Result<(), ProgramError> {
+    if amount > leaf_amount {
+        return Err(ZupyTokenError::InsufficientBalance.into());
+    }
+    Ok(())
+}
+
 #[inline(always)]
 pub fn cpi_decompress_to_spl(
     accounts: &DecompressToSplAccounts,
     params: &DecompressToSplParams,
     signers: &[Signer],
 ) -> Result<(), ProgramError> {
+    validate_decompress_amounts(params.leaf_amount, params.amount)?;
     let data = build_decompress_to_spl_data(params);
     let prog_id: Address = LIGHT_COMPRESSED_TOKEN_PROGRAM_ID.into();
 
@@ -1307,6 +1327,48 @@ mod tests {
             assert_eq!(data[175], v, "in_token_data version");
             assert_eq!(data[201], v, "out_token_data version must match");
         }
+    }
+
+    // ── validate_decompress_amounts (guarda do sum check) ────────────────────
+
+    #[test]
+    fn test_decompress_amounts_ok_quando_amount_cabe_no_leaf() {
+        assert!(validate_decompress_amounts(3_943_000_000, 1_000_000).is_ok());
+    }
+
+    #[test]
+    fn test_decompress_amounts_ok_quando_gasta_o_leaf_inteiro() {
+        // Troco zero e legitimo: gastar a folha toda fecha o sum check em 0.
+        assert!(validate_decompress_amounts(1_000_000, 1_000_000).is_ok());
+    }
+
+    #[test]
+    fn test_decompress_amounts_rejeita_amount_maior_que_o_leaf() {
+        // Sem a guarda o saturating_sub do troco satura em 0 e o sum check vira
+        // +leaf - amount - 0 < 0: o cToken rejeita, mas so depois de ~211k CU.
+        let err = validate_decompress_amounts(1_000_000, 1_000_001).unwrap_err();
+        assert_eq!(err, ZupyTokenError::InsufficientBalance.into());
+    }
+
+    #[test]
+    fn test_decompress_amounts_rejeita_leaf_zerado() {
+        let err = validate_decompress_amounts(0, 1).unwrap_err();
+        assert_eq!(err, ZupyTokenError::InsufficientBalance.into());
+    }
+
+    #[test]
+    fn test_o_troco_satura_em_zero_e_por_isso_a_guarda_existe() {
+        // Prova o motivo da guarda: HOJE o builder aceita amount > leaf_amount e
+        // monta uma instrucao que ja se sabe invalida. O troco vira 0 em vez de
+        // negativo, entao nada aqui reclama -- quem reclama e a chain, caro.
+        let p = [0u8; 128];
+        let mut params = proven_params(&p);
+        params.amount = params.leaf_amount + 1;
+        let data = build_decompress_to_spl_data(&params);
+        let troco = u64::from_le_bytes(data[190..198].try_into().unwrap());
+        assert_eq!(troco, 0, "saturating_sub mascara o estouro");
+        let declarado = u64::from_le_bytes(data[15..23].try_into().unwrap());
+        assert!(declarado > params.leaf_amount, "sai mais do que entrou");
     }
 
     #[test]
