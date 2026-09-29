@@ -3,10 +3,15 @@ use pinocchio::{AccountView, Address, ProgramResult};
 use crate::constants::USER_SEED;
 use crate::helpers::return_to_pool_common::v1_passthrough_to_pool;
 
-/// DEPRECATED (2026-04-04): Mainnet cToken upgraded to V2 (slot ~405M).
-/// V1 TRANSFER discriminator no longer present in mainnet binary.
-/// Use `return_user_to_pool` (instruction #19, V2 native) instead.
-/// Retained in the program binary for backwards compatibility — not called by backend.
+/// Superseded by `return_user_to_pool` (Transfer2 decompress with proof — `return_to_pool`
+/// has 109 mainnet successes since 2026-08-22, story 3.16 Q3). Not called by
+/// the backend; retained in the binary for backwards compatibility.
+///
+/// ⚠️ MEASURED 2026-09-29 (story 3.21): the former note "V1 TRANSFER
+/// discriminator no longer present in mainnet binary" was WRONG — the mainnet
+/// cToken still dispatches `global:transfer` (successful
+/// `transfer_company_to_user`, tx `66bFvExd…YxHu8`). Whether this user→pool
+/// decompress shape still succeeds on mainnet is NÃO VERIFICADO.
 ///
 /// Process `return_user_to_pool_v1` instruction (V1 CPI passthrough, formerly mainnet-only).
 ///

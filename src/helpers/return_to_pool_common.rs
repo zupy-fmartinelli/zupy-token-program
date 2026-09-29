@@ -10,15 +10,15 @@
 
 use pinocchio::cpi::{Seed, Signer};
 use pinocchio::error::ProgramError;
-use pinocchio::instruction::InstructionView;
 use pinocchio::{AccountView, Address, ProgramResult};
 
 use crate::constants::{
     LIGHT_COMPRESSED_TOKEN_PROGRAM_ID, LIGHT_TOKEN_CPI_AUTHORITY, TOKEN_2022_PROGRAM_ID,
 };
+use crate::helpers::v1_transfer::invoke_v1_transfer_signed;
 use crate::error::ZupyTokenError;
 use crate::helpers::compressed_accounts::{
-    build_metas_forcing_signer, cpi_decompress_to_spl, derive_spl_interface_pda,
+    cpi_decompress_to_spl, derive_spl_interface_pda,
     parse_leaf_proof_fields, validate_v1_transfer_disc, DecompressToSplAccounts,
 };
 use crate::helpers::instruction_data::{parse_string, parse_u64, parse_u8};
@@ -202,7 +202,14 @@ pub fn decompress_to_pool(
     Ok(())
 }
 
-/// DEPRECATED (2026-04-04): Mainnet cToken upgraded to V2. Use `decompress_to_pool` instead.
+/// Superseded by `decompress_to_pool` (Transfer2 decompress, 109 mainnet
+/// successes since 2026-08-22 — story 3.16 Q3); the backend no longer calls it.
+///
+/// ⚠️ MEASURED 2026-09-29 (story 3.21): the old "DEPRECATED — V1 TRANSFER no
+/// longer in the mainnet cToken" note was WRONG. The mainnet cToken still
+/// dispatches `global:transfer` (successful `transfer_company_to_user`, tx
+/// 66bFvExd…YxHu8). Whether THIS decompress shape still succeeds on mainnet is
+/// NÃO VERIFICADO (no call since the deploy, no simulation).
 ///
 /// V1 CPI passthrough: forwards pre-built V1 TRANSFER to cToken program.
 ///
@@ -266,21 +273,6 @@ pub fn v1_passthrough_to_pool(
         pool_ata,
     )?;
 
-    // ── Build CPI instruction for cToken V1 ───────────────────────────────
-    let prog_id: Address = LIGHT_COMPRESSED_TOKEN_PROGRAM_ID.into();
-    let cpi_accounts = &accounts[6..];
-
-    // Build account metas, forcing entity_pda to be signer for invoke_signed.
-    let account_metas = build_metas_forcing_signer(cpi_accounts, entity_pda);
-
-    let instruction = InstructionView {
-        program_id: &prog_id,
-        accounts: &account_metas,
-        data: v1_cpi_data,
-    };
-
-    let account_views: Vec<&AccountView> = cpi_accounts.iter().collect();
-
     // ── CPI: Forward V1 TRANSFER to cToken, signing with entity PDA ──────
     let entity_id_bytes = entity_id_u64.to_le_bytes();
     let bump_bytes = [entity_bump];
@@ -289,9 +281,5 @@ pub fn v1_passthrough_to_pool(
         Seed::from(entity_id_bytes.as_ref()),
         Seed::from(bump_bytes.as_ref()),
     ];
-    let signer = Signer::from(&signer_seeds);
-
-    pinocchio::cpi::invoke_signed_with_slice(&instruction, &account_views, &[signer])?;
-
-    Ok(())
+    invoke_v1_transfer_signed(&accounts[6..], entity_pda, v1_cpi_data, &[Signer::from(&signer_seeds)])
 }

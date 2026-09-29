@@ -10,10 +10,13 @@
 //! - [`cpi_decompress_to_spl`]: Compressed leaf → SPL ATA.
 //!   Uses Transfer2 (disc=101). Dispatches, accounts accepted, reaches business logic.
 //!
-//! ## Path B — Compressed → Compressed (ZK proof required)
+//! ## Path B — cToken-account transfer (disc=3) — NOT for compressed Z$
 //!
-//! - [`cpi_compressed_transfer`]: Compressed → compressed transfer.
-//!   Requires `ValidityProof` for input account existence.
+//! - [`cpi_compressed_transfer`]: despite the name, the cToken `Transfer` disc=3
+//!   moves **cToken Solana accounts** (decompressed, owned by the cToken
+//!   program). It carries no proof and cannot spend a compressed leaf.
+//!   Compressed → compressed on mainnet is the V1 TRANSFER passthrough in
+//!   `helpers::v1_transfer` (story 3.21).
 //!
 //! ## Path C — Compressed Burn
 //!
@@ -35,31 +38,23 @@
 //! (`cTokenmWW8bLPjZEBAUgYy3zKxQZW6VKi7bqNFEVv3m`). This is the current live interface —
 //! NOT a legacy value. `compress_spl_token_account` remains Anchor 8-byte (separate codepath).
 //!
-//! ## Mainnet V2 (Upgraded 2026-04-04 verified)
+//! ## What the mainnet cToken accepts — MEASURED 2026-09-29 (story 3.21)
 //!
-//! Both **mainnet** and **devnet** now run cToken V2. Light Protocol upgraded
-//! mainnet at slot ~405,926,389 (binary: 1.15MB, was 642KB V1).
-//! Binary analysis confirmed: Transfer2, Decompress, CTokenBurn handlers present;
-//! V1 Anchor dispatch (`global:transfer`) NOT found in mainnet binary.
+//! Replaces the 2026-04-04 table ("all V2 operations available, V1 transfer no
+//! longer present"), which was partly wrong: its V1 conclusion came from a
+//! search for 8 CONTIGUOUS discriminator bytes, but SBF stores a 64-bit
+//! immediate (`lddw`) as two 32-bit halves — that search misses every Anchor
+//! discriminator, including ones that demonstrably work.
 //!
-//! | Operation | Disc | Mainnet Status |
-//! |-----------|------|----------------|
-//! | `compress_spl_token_account` | 8-byte Anchor | **WORKS** |
-//! | Transfer2 (decompress/transfer) | disc=101 | **WORKS** |
-//! | Compressed transfer | disc=3 | **WORKS** |
-//! | Burn | disc=8 | **WORKS** |
+//! | Operation | Disc | Mainnet status (evidence) |
+//! |-----------|------|---------------------------|
+//! | V1 `transfer` (compressed → compressed, proof) | `global:transfer` 8-byte | **WORKS** — tx `66bFvExd…YxHu8` (slot 451624459, `transfer_company_to_user`); dispatch at `lddw` 0x9cd68 of the dump (sha256 `4d4575df…`) |
+//! | Transfer2 (decompress with proof) | disc=101 | **WORKS** — 109 successful `return_to_pool` since 2026-08-22 (story 3.16 Q3) |
+//! | `compress_spl_token_account` | 8-byte Anchor | **WORKS** — 4 successful `transfer_from_pool` in a 1-in-8 sample of the last 1,000 signatures (2026-09-29) |
+//! | cToken-account `Transfer` | disc=3 | **FAILS for compressed Z$** — `Custom(18063) InvalidTokenOwner` (unsigned simulation, story 3.17: `execute_split_transfer` and `transfer_user_to_company`) |
+//! | Burn | disc=8 | NÃO VERIFICADO — no call since the deploy (3.16 Q5); Zupy does not burn (D-51) |
 //!
-//! All V2 operations are available on mainnet. The V1 CPI passthrough instructions
-//! (`return_to_pool_v1`, `return_user_to_pool_v1`) are **DEPRECATED** — the V1
-//! TRANSFER discriminator `[163,52,200,231,140,3,69,186]` is no longer present
-//! in the mainnet binary. Use the native V2 instructions (`return_to_pool`,
-//! `return_user_to_pool`) instead.
-//!
-//! ### Historical Note (pre-2026-04)
-//!
-//! Before slot ~405M, mainnet ran V1 (Anchor-based, 642KB, slot 351672434).
-//! Transfer2 (disc=101) and Burn (disc=8) were BLOCKED, requiring V1 CPI
-//! passthrough via `TRANSFER_V1_DISC`. See sprint-change-proposal-2026-02-19.md.
+//! Dump reproducible read-only: `solana program dump -u m cTokenmWW8bLPjZEBAUgYy3zKxQZW6VKi7bqNFEVv3m ctoken.so`.
 
 use pinocchio::AccountView;
 use pinocchio::Address;
@@ -128,15 +123,14 @@ const COMPRESS_SPL_TOKEN_ACCOUNT_DISC: [u8; 8] = [112, 230, 105, 101, 145, 202, 
 /// Note: Transfer2 dispatches via a 1-byte discriminator, not an Anchor instruction name.
 const TRANSFER2_DISC: u8 = 101;
 
-/// DEPRECATED (2026-04-04): Mainnet cToken upgraded to V2 (slot ~405M).
-/// V1 Anchor dispatch (`global:transfer`) no longer present in mainnet binary.
-/// Use Transfer2 (disc=101) via the native `return_to_pool` / `return_user_to_pool`
-/// instructions instead.
-///
 /// V1 TRANSFER discriminator for the Light cToken program (Anchor 8-byte).
 /// = SHA256("global:transfer")[0..8]
-/// Was used by mainnet V1 cToken for ALL transfer operations.
-/// Retained for the `return_*_v1` passthrough instructions (also deprecated).
+///
+/// **LIVE on mainnet — MEASURED 2026-09-29 (story 3.21).** Used by
+/// `transfer_company_to_user` (successful tx `66bFvExd…YxHu8`, slot 451624459),
+/// `transfer_user_to_company` and `execute_split_transfer` (3.21), and the
+/// superseded `return_*_v1`. The old "DEPRECATED — no longer in the mainnet
+/// binary" note was a contiguous-byte search artefact (see module docs).
 pub(crate) const TRANSFER_V1_DISC: [u8; 8] = [163, 52, 200, 231, 140, 3, 69, 186];
 
 /// Validates that raw CPI data starts with the V1 TRANSFER discriminator.
@@ -686,9 +680,9 @@ pub fn cpi_decompress_to_spl(
 /// [1..9] amount (u64 LE)
 /// ```
 ///
-/// The cToken program validates that `authority` owns the `source` compressed token
-/// balance and transfers `amount` to `destination`. No ValidityProof is passed in
-/// instruction data — the source authority's PDA signature is sufficient.
+/// This is the cToken **account** transfer: `source`/`destination` are cToken
+/// Solana accounts (decompressed, owned by the cToken program), not compressed
+/// leaves. No ValidityProof travels because no leaf is spent.
 #[inline]
 pub(crate) fn build_compressed_transfer_data(amount: u64) -> [u8; 9] {
     let mut d = [0u8; 9];
@@ -697,7 +691,19 @@ pub(crate) fn build_compressed_transfer_data(amount: u64) -> [u8; 9] {
     d
 }
 
-/// CPI: Transfer tokens between two compressed accounts (Path B).
+/// CPI: cToken **account** `Transfer` (discriminator = 3).
+///
+/// ⚠️ MEASURED 2026-09-29 — what it can and CANNOT do on mainnet:
+/// - It CANNOT move Z$: Z$ balances are compressed leaves owned by our PDAs,
+///   and the cToken answers `Custom(18063) InvalidTokenOwner` (unsigned mainnet
+///   simulation, story 3.17 — `execute_split_transfer` and, in the 3.17 review,
+///   `transfer_user_to_company`, both built on this helper up to `396df04`).
+/// - It CAN only move tokens between cToken Solana accounts (the decompressed
+///   "light token account" form), which Zupy does not use. NÃO VERIFICADO on
+///   mainnet for that use, since no Zupy flow has such accounts.
+/// - Since story 3.21 no instruction calls it; client spends use the V1
+///   TRANSFER passthrough (`helpers::v1_transfer`). Kept only so the removal is
+///   a separate, reviewed decision.
 ///
 /// Calls the Light cToken program (`cTokenmWW8bLPjZEBAUgYy3zKxQZW6VKi7bqNFEVv3m`)
 /// with `Transfer` instruction (discriminator = 3). The `authority` must sign (typically

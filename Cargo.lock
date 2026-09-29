@@ -10491,6 +10491,7 @@ name = "zupy-token-program"
 version = "1.3.0"
 dependencies = [
  "five8_const 1.0.0",
+ "light-batched-merkle-tree",
  "light-program-test",
  "light-sdk-pinocchio",
  "light-token-pinocchio",

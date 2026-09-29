@@ -39,7 +39,7 @@ const DISC_BURN_FROM_COMPANY_PDA: [u8; 8] = [43, 207, 204, 77, 74, 93, 165, 34];
 ///   [6] fee_payer (writable, signer)
 ///   [7] system_program (read)
 ///   [8] compressed_token_program (read) — Light cToken
-///   [9+] Light system accounts (passed by client)
+///   [9+] V1 cToken CPI accounts (fee_payer, authority = user_pda, …) — story 3.21
 mod execute_split_transfer {
     use super::*;
 
@@ -525,93 +525,204 @@ mod execute_split_transfer {
         println!("split_transfer: wrong_compressed_token_program CU={}", result.compute_units_consumed);
     }
 
-    // ── Full compressed split flow (validation path) ──────────────────
+    // ── V1 TRANSFER with proof (story 3.21) ─────────────────────────────
     //
-    // KNOWN LIMITATION: basic Mollusk does not load the Light cToken SBF binary,
-    // so the actual compressed state changes (output leaf ownership, nullifier
-    // insertion, mint supply decrement) cannot be asserted here. This test proves
-    // all on-chain validation passes and the instruction correctly dispatches to
-    // the first compressed CPI.
-    //
-    // Full verification (3-way state changes) requires a Light Protocol
-    // integration environment with the cToken program loaded.
-    // TODO: add full Light cToken integration test when available.
+    // Since 3.21 the split forwards ONE cToken V1 TRANSFER (with validity
+    // proof) built by the backend, appended after `operation_type`; the V1
+    // CPI accounts start at index 9. Basic Mollusk does not load the cToken,
+    // so "success" here means: every check passed and the CPI was attempted
+    // (`UnsupportedProgramId`). The real cToken/Light binaries run in
+    // `tests/test_mainnet_fork.rs`.
+
+    fn split_ix(
+        s: &TestSetup,
+        ts_data: Vec<u8>,
+        company_amount: u64,
+        pool_amount: u64,
+        v1: &[u8],
+        cpi_authority: &Pubkey,
+    ) -> (Instruction, Vec<(Pubkey, Account)>) {
+        let mut payload = build_payload(
+            s.user_id, s.company_id, company_amount, pool_amount,
+            s.user_bump, s.company_bump, s.incentive_bump, "z_direct",
+        );
+        payload.extend_from_slice(v1);
+        let data = build_ix_data(&DISC_EXECUTE_SPLIT_TRANSFER, &payload);
+        let mut metas = build_ix_metas(
+            &s.transfer_auth, &s.token_state_pda, &s.mint,
+            &s.user_pda, &s.company_pda, &s.incentive_pool_pda, &s.fee_payer,
+        );
+        metas.extend(v1_cpi_tail_metas(&s.fee_payer, cpi_authority));
+        let mut accounts = build_accounts(
+            &s.transfer_auth, &s.token_state_pda, ts_data, &s.mint,
+            &s.user_pda, &s.company_pda, &s.incentive_pool_pda, &s.fee_payer,
+        );
+        if !accounts.iter().any(|(k, _)| k == cpi_authority) {
+            accounts.push((*cpi_authority, make_system_account(0)));
+        }
+        (Instruction::new_with_bytes(program_id(), &data, metas), accounts)
+    }
+
+    fn split_state(s: &TestSetup) -> Vec<u8> {
+        make_split_token_state(
+            &Pubkey::new_unique(), &s.transfer_auth, &s.mint, &Pubkey::new_unique(),
+            &s.incentive_pool_pda, s.bump, true, false,
+        )
+    }
+
+    /// Valid 3-output payload: 1_000_000 leaf → company 800_000, pool 40_000, change 160_000.
+    fn v1_split(s: &TestSetup, leaf: u64, company: u64, pool: u64) -> Vec<u8> {
+        let mut outs = vec![(s.company_pda, company, 0u8)];
+        if pool > 0 {
+            outs.push((s.incentive_pool_pda, pool, 0));
+        }
+        if leaf > company + pool {
+            outs.push((s.user_pda, leaf - company - pool, 0));
+        }
+        build_v1_transfer(&s.mint, Some([9u8; 128]), &[V1Input::with_proof(leaf)], &outs)
+    }
 
     #[test]
     fn test_full_split_flow_reaches_cpi_stage() {
         let mollusk = setup_mollusk();
         let s = setup();
-        let ts_data = make_split_token_state(
-            &Pubkey::new_unique(), &s.transfer_auth, &s.mint, &Pubkey::new_unique(),
-            &s.incentive_pool_pda, s.bump, true, false,
-        );
-
-        let payload = build_payload(s.user_id, s.company_id, 1_000_000, 0, s.user_bump, s.company_bump, s.incentive_bump, "mixed_payment");
-        let data = build_ix_data(&DISC_EXECUTE_SPLIT_TRANSFER, &payload);
-        let metas = build_ix_metas(
-            &s.transfer_auth, &s.token_state_pda, &s.mint,
-            &s.user_pda, &s.company_pda, &s.incentive_pool_pda, &s.fee_payer,
-        );
-        let instruction = Instruction::new_with_bytes(program_id(), &data, metas);
-        let accounts = build_accounts(
-            &s.transfer_auth, &s.token_state_pda, ts_data, &s.mint,
-            &s.user_pda, &s.company_pda, &s.incentive_pool_pda, &s.fee_payer,
-        );
-
-        let result = mollusk.process_instruction(&instruction, &accounts);
-
-        // Must NOT fail at any validation error (zero, op_type, token_state, PDA, ctoken_program).
-        // Will fail at first compressed CPI (Light cToken not loaded in basic Mollusk),
-        // but that proves all on-chain validation passes.
-        let is_validation_err = matches!(
-            result.raw_result,
-            Err(InstructionError::Custom(e)) if matches!(e, 6000..=6028)
-        );
-        assert!(
-            !is_validation_err,
-            "Must not fail at validation — expected CPI failure, got: {:?}",
-            result.raw_result
-        );
-        println!(
-            "split_transfer: full_split_flow_compressed CU={} (validation OK, fails at CPI as expected)",
-            result.compute_units_consumed
-        );
+        let v1 = v1_split(&s, 1_000_000, 800_000, 40_000);
+        let (ix, accounts) = split_ix(&s, split_state(&s), 800_000, 40_000, &v1, &s.user_pda);
+        let result = mollusk.process_instruction(&ix, &accounts);
+        // Every check passed; the only thing left is the cToken CPI (not loaded here).
+        assert_eq!(result.raw_result, Err(InstructionError::UnsupportedProgramId));
+        println!("split_transfer: full V1 flow CU={} (reaches cToken CPI)", result.compute_units_consumed);
     }
 
-    // ── CU benchmark with 3 compressed CPIs ──────────────────────────────
+    #[test]
+    fn test_pool_zero_skips_pool_output_and_reaches_cpi() {
+        let mollusk = setup_mollusk();
+        let s = setup();
+        let v1 = v1_split(&s, 1_000_000, 800_000, 0);
+        let (ix, accounts) = split_ix(&s, split_state(&s), 800_000, 0, &v1, &s.user_pda);
+        let result = mollusk.process_instruction(&ix, &accounts);
+        assert_eq!(result.raw_result, Err(InstructionError::UnsupportedProgramId));
+    }
+
+    /// The 396df04 / 3.17 adapter sends only the header. It must fail closed,
+    /// before any CPI (it used to reach the disc=3 CPI and die with 18063).
+    #[test]
+    fn test_header_only_payload_fails_before_cpi() {
+        let mollusk = setup_mollusk();
+        let s = setup();
+        let (ix, accounts) = split_ix(&s, split_state(&s), 800_000, 40_000, &[], &s.user_pda);
+        let result = mollusk.process_instruction(&ix, &accounts);
+        assert_eq!(result.raw_result, Err(InstructionError::InvalidInstructionData));
+    }
+
+    #[test]
+    fn test_insufficient_balance_in_leaf() {
+        let mollusk = setup_mollusk();
+        let s = setup();
+        let v1 = build_v1_transfer(
+            &s.mint, Some([9u8; 128]), &[V1Input::with_proof(500_000)],
+            &[(s.company_pda, 800_000, 0), (s.incentive_pool_pda, 40_000, 0)],
+        );
+        let (ix, accounts) = split_ix(&s, split_state(&s), 800_000, 40_000, &v1, &s.user_pda);
+        let result = mollusk.process_instruction(&ix, &accounts);
+        assert_ix_custom_err(&result, 6004); // InsufficientBalance
+    }
+
+    #[test]
+    fn test_zero_company_leg_rejected() {
+        let mollusk = setup_mollusk();
+        let s = setup();
+        let v1 = v1_split(&s, 1_000_000, 0, 40_000);
+        let (ix, accounts) = split_ix(&s, split_state(&s), 0, 40_000, &v1, &s.user_pda);
+        let result = mollusk.process_instruction(&ix, &accounts);
+        assert_ix_custom_err(&result, 6012); // ZeroAmount
+    }
+
+    #[test]
+    fn test_legs_overflow_rejected() {
+        let mollusk = setup_mollusk();
+        let s = setup();
+        let v1 = v1_split(&s, 1_000_000, 800_000, 40_000);
+        let (ix, accounts) = split_ix(&s, split_state(&s), u64::MAX, 1, &v1, &s.user_pda);
+        let result = mollusk.process_instruction(&ix, &accounts);
+        assert_ix_custom_err(&result, 6029); // SplitCalculationError
+    }
+
+    #[test]
+    fn test_payload_pool_amount_disagrees_with_header() {
+        let mollusk = setup_mollusk();
+        let s = setup();
+        let v1 = v1_split(&s, 1_000_000, 800_000, 50_000); // header says 40_000
+        let (ix, accounts) = split_ix(&s, split_state(&s), 800_000, 40_000, &v1, &s.user_pda);
+        let result = mollusk.process_instruction(&ix, &accounts);
+        assert_ix_custom_err(&result, 6005); // InvalidAmount
+    }
+
+    #[test]
+    fn test_payload_sends_company_leg_elsewhere() {
+        let mollusk = setup_mollusk();
+        let s = setup();
+        let v1 = build_v1_transfer(
+            &s.mint, Some([9u8; 128]), &[V1Input::with_proof(840_000)],
+            &[(Pubkey::new_unique(), 800_000, 0), (s.incentive_pool_pda, 40_000, 0)],
+        );
+        let (ix, accounts) = split_ix(&s, split_state(&s), 800_000, 40_000, &v1, &s.user_pda);
+        let result = mollusk.process_instruction(&ix, &accounts);
+        assert_ix_custom_err(&result, 6007); // InvalidPDA
+    }
+
+    #[test]
+    fn test_payload_with_foreign_mint() {
+        let mollusk = setup_mollusk();
+        let s = setup();
+        let v1 = build_v1_transfer(
+            &Pubkey::new_unique(), Some([9u8; 128]), &[V1Input::with_proof(840_000)],
+            &[(s.company_pda, 800_000, 0), (s.incentive_pool_pda, 40_000, 0)],
+        );
+        let (ix, accounts) = split_ix(&s, split_state(&s), 800_000, 40_000, &v1, &s.user_pda);
+        let result = mollusk.process_instruction(&ix, &accounts);
+        assert_ix_custom_err(&result, 6011); // InvalidMint
+    }
+
+    /// The V1 authority (who owns the input leaves for the cToken) must be the
+    /// user PDA the program signs for — never a company or anyone else.
+    #[test]
+    fn test_cpi_authority_must_be_user_pda() {
+        let mollusk = setup_mollusk();
+        let s = setup();
+        let v1 = v1_split(&s, 1_000_000, 800_000, 40_000);
+        let (ix, accounts) = split_ix(&s, split_state(&s), 800_000, 40_000, &v1, &s.company_pda);
+        let result = mollusk.process_instruction(&ix, &accounts);
+        assert_ix_custom_err(&result, 6007); // InvalidPDA
+    }
+
+    #[test]
+    fn test_missing_cpi_accounts() {
+        let mollusk = setup_mollusk();
+        let s = setup();
+        let v1 = v1_split(&s, 1_000_000, 800_000, 40_000);
+        let (mut ix, accounts) = split_ix(&s, split_state(&s), 800_000, 40_000, &v1, &s.user_pda);
+        ix.accounts.truncate(9); // no V1 CPI tail
+        let result = mollusk.process_instruction(&ix, &accounts);
+        assert_ix_not_enough_keys(&result);
+    }
+
+    // ── CU benchmark (validation + V1 payload check, up to the CPI) ──────
 
     #[test]
     fn test_cu_benchmark_compressed_validation_path() {
         let mollusk = setup_mollusk();
         let s = setup();
-        let ts_data = make_split_token_state(
-            &Pubkey::new_unique(), &s.transfer_auth, &s.mint, &Pubkey::new_unique(),
-            &s.incentive_pool_pda, s.bump, true, false,
-        );
-
-        let payload = build_payload(s.user_id, s.company_id, 1_000_000, 0, s.user_bump, s.company_bump, s.incentive_bump, "mixed_payment");
-        let data = build_ix_data(&DISC_EXECUTE_SPLIT_TRANSFER, &payload);
-        let metas = build_ix_metas(
-            &s.transfer_auth, &s.token_state_pda, &s.mint,
-            &s.user_pda, &s.company_pda, &s.incentive_pool_pda, &s.fee_payer,
-        );
-        let instruction = Instruction::new_with_bytes(program_id(), &data, metas);
-        let accounts = build_accounts(
-            &s.transfer_auth, &s.token_state_pda, ts_data, &s.mint,
-            &s.user_pda, &s.company_pda, &s.incentive_pool_pda, &s.fee_payer,
-        );
-
-        let result = mollusk.process_instruction(&instruction, &accounts);
-        // Measures CU through all on-chain validation + first CPI dispatch attempt.
-        // Light cToken not loaded in basic Mollusk → fails at first cpi_compressed_transfer.
-        // KNOWN LIMITATION: the 30,000 threshold covers the validation path only.
-        // Actual CU for 3 compressed CPIs + ZK proof verification on mainnet-beta
-        // must be measured in a full Light Protocol integration environment
-        // before production deploy.
+        let v1 = v1_split(&s, 1_000_000, 800_000, 40_000);
+        let (ix, accounts) = split_ix(&s, split_state(&s), 800_000, 40_000, &v1, &s.user_pda);
+        let result = mollusk.process_instruction(&ix, &accounts);
+        // The full CPI (cToken + Light system + proof verification) is measured
+        // with the real mainnet binaries in tests/test_mainnet_fork.rs.
         println!(
-            "  execute_split_transfer_compressed  CU: {:>6}  (validation-path only — 2×CPI burn-free, CU unmeasured)",
+            "  execute_split_transfer (V1)        CU: {:>6}  (validation + payload check, up to the CPI)",
             result.compute_units_consumed
         );
+        assert_eq!(result.raw_result, Err(InstructionError::UnsupportedProgramId));
         assert!(
             result.compute_units_consumed <= 30_000,
             "execute_split_transfer validation-path CU {} exceeds 30,000 threshold",
@@ -1429,7 +1540,7 @@ fn test_cu_benchmark_all_split_burn_instructions() {
 
     println!("\n═══ CU Benchmark: Split Transfer + Burns ═══");
 
-    // ── execute_split_transfer (compressed layout, 9 accounts) ──
+    // ── execute_split_transfer (9 accounts + V1 CPI tail, story 3.21) ──
     {
         let transfer_auth = Pubkey::new_unique();
         let mint = Pubkey::new_unique();
@@ -1445,18 +1556,23 @@ fn test_cu_benchmark_all_split_burn_instructions() {
             &incentive_pool_pda, bump, true, false,
         );
 
+        // Header (explicit legs) + V1 TRANSFER with proof (story 3.21).
         let mut payload = Vec::new();
         payload.extend_from_slice(&user_id.to_le_bytes());
         payload.extend_from_slice(&company_id.to_le_bytes());
-        payload.extend_from_slice(&1_000_000u64.to_le_bytes());
+        payload.extend_from_slice(&800_000u64.to_le_bytes()); // company_amount
+        payload.extend_from_slice(&40_000u64.to_le_bytes()); // pool_amount
         payload.push(user_bump);
         payload.push(company_bump);
         payload.push(incentive_bump);
         payload.extend_from_slice(&build_string("mixed_payment"));
+        payload.extend_from_slice(&build_v1_transfer(
+            &mint, Some([9u8; 128]), &[V1Input::with_proof(1_000_000)],
+            &[(company_pda, 800_000, 0), (incentive_pool_pda, 40_000, 0), (user_pda, 160_000, 0)],
+        ));
         let data = build_ix_data(&DISC_EXECUTE_SPLIT_TRANSFER, &payload);
 
-        // New 9-account compressed layout
-        let metas = vec![
+        let mut metas = vec![
             AccountMeta::new(transfer_auth, true),                     // 0: signer
             AccountMeta::new_readonly(token_state_pda, false),         // 1
             AccountMeta::new_readonly(mint, false),                    // 2
@@ -1467,6 +1583,7 @@ fn test_cu_benchmark_all_split_burn_instructions() {
             AccountMeta::new_readonly(system_program_id(), false),     // 7
             AccountMeta::new_readonly(ctoken_program_id(), false),     // 8: Light cToken
         ];
+        metas.extend(v1_cpi_tail_metas(&fee_payer, &user_pda)); // 9+: V1 CPI accounts
         let instruction = Instruction::new_with_bytes(program_id(), &data, metas);
         let accounts = vec![
             (transfer_auth, make_system_account(1_000_000)),
@@ -1480,9 +1597,10 @@ fn test_cu_benchmark_all_split_burn_instructions() {
             make_program_stub(&ctoken_program_id()),
         ];
 
-        // Reaches first compressed CPI (Light cToken not loaded in basic Mollusk) —
-        // measures CU through all on-chain validation + CPI dispatch.
+        // Reaches the V1 cToken CPI (not loaded in basic Mollusk) — measures CU
+        // through all on-chain validation + payload check + CPI dispatch.
         let result = mollusk.process_instruction(&instruction, &accounts);
+        assert_eq!(result.raw_result, Err(InstructionError::UnsupportedProgramId));
         println!("  execute_split_transfer  CU: {:>6}  (validation + CPI attempt, target ≤30,000)", result.compute_units_consumed);
         assert!(result.compute_units_consumed <= 30_000, "split CU {} > 30,000", result.compute_units_consumed);
     }

@@ -5,8 +5,12 @@ use crate::helpers::return_to_pool_common::decompress_to_pool;
 
 /// Process `return_to_pool` instruction (compressed version).
 ///
-/// Decompresses company compressed balance back to the pool ATA via Light Protocol.
-/// Path A reverse — no separate ValidityProof param needed (Light system accounts handle proof).
+/// Decompresses company compressed balance back to the pool ATA via Light Protocol
+/// (cToken Transfer2, disc=101, with the Photon validity proof in the leaf/proof block).
+///
+/// **MEASURED: WORKS on mainnet** — 109 successful calls since the 2026-08-22
+/// deploy (story 3.16 Q3, checked 2026-09-29; 11 failures in the same window,
+/// e.g. `pHx7GJuZ…`, not diagnosed here).
 ///
 /// Delegates to [`decompress_to_pool`] with `COMPANY_SEED`.
 /// See that function for full account layout, data format, and security validations.

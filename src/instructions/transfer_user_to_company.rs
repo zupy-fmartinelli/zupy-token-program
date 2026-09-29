@@ -4,29 +4,51 @@ use pinocchio::error::ProgramError;
 
 use crate::constants::{COMPANY_SEED, USER_SEED};
 use crate::error::ZupyTokenError;
-use crate::helpers::compressed_accounts::cpi_compressed_transfer;
 use crate::helpers::instruction_data::{parse_string, parse_u64, parse_u8};
 use crate::helpers::memo::validate_memo_format;
 use crate::helpers::pda::{validate_light_ctoken_program, validate_id_pda};
 use crate::helpers::transfer_validation::validate_transfer_common_compressed;
+use crate::helpers::v1_transfer::{
+    invoke_v1_transfer_signed, validate_v1_authority, validate_v1_transfer_payload, V1Leg,
+};
+
+/// Index of the first V1 cToken CPI account (`fee_payer`, then `authority`, …).
+pub const U2C_V1_CPI_ACCOUNTS_START: usize = 8;
 
 /// Process `transfer_user_to_company` instruction.
 ///
-/// Transfers ZUPY from user compressed balance to company compressed balance via
-/// Light cToken `Transfer` CPI (Path B: compressed → compressed). No ATA created.
+/// Moves Z$ from the user's compressed leaves to the company PDA (client →
+/// store, used by "Pérolas + Z$" and settlement of "Só Z$").
 ///
-/// Accounts (8):
+/// ## 2026-09-29 (story 3.21) — why this changed, MEASURED
+///
+/// Up to `396df04` this instruction called `cpi_compressed_transfer` (cToken
+/// disc=3, no proof). Unsigned mainnet simulation (3.17 code review, user
+/// `2140389439281718293` → company `9068097475314820308`) fails with
+/// `Custom(18063) InvalidTokenOwner` — disc=3 moves cToken *Solana accounts*,
+/// not compressed leaves. It now forwards a V1 TRANSFER with validity proof
+/// (the working `transfer_company_to_user` mechanism), signed by the user PDA,
+/// after checking the payload moves exactly `amount` to the company plus an
+/// optional change back to the user.
+///
+/// Accounts (10+):
+/// ```text
 ///   0. transfer_authority (signer)
 ///   1. token_state (read)
 ///   2. mint (read)
-///   3. user_pda (read)                 — source owner / PDA signer
-///   4. company_pda (read)              — destination owner
-///   5. fee_payer (writable, signer)    — pays Light state tree fees
-///   6. system_program (read)
+///   3. user_pda (read)                 — owner of the input leaves / PDA signer
+///   4. company_pda (read)              — owner of output 0
+///   5. fee_payer (writable, signer)    — kept for layout compatibility
+///   6. system_program (read)           — kept for layout compatibility
 ///   7. compressed_token_program (read) — cTokenmWW8bLPjZEBAUgYy3zKxQZW6VKi7bqNFEVv3m
+///   8+. V1 cToken CPI accounts (same order as `transfer_company_to_user` [5..],
+///       with authority = user_pda)
+/// ```
 ///
-/// Data: user_id_u64 (u64) + company_id_u64 (u64) + amount (u64)
-///       + user_bump (u8) + company_bump (u8) + memo (String)
+/// Data: user_id u64 + company_id u64 + amount u64 + user_bump u8 + company_bump u8
+///       + memo (String) + V1 TRANSFER cToken data (disc + Vec<u8> Borsh).
+/// A caller that stops after the memo (the `396df04` adapter) now fails with
+/// `InvalidInstructionData` BEFORE any CPI.
 ///
 /// Discriminator: [186, 233, 22, 40, 87, 223, 252, 131] — UNCHANGED
 pub fn process(
@@ -34,18 +56,17 @@ pub fn process(
     accounts: &[AccountView],
     data: &[u8],
 ) -> ProgramResult {
-    // ── Account extraction (8 accounts minimum) ─────────────────────────
-    if accounts.len() < 8 {
+    // ── Account extraction (8 accounts minimum before the V1 CPI tail) ──
+    if accounts.len() < U2C_V1_CPI_ACCOUNTS_START {
         return Err(ProgramError::NotEnoughAccountKeys);
     }
     let transfer_authority = &accounts[0];
     let token_state_account = &accounts[1];
     let mint = &accounts[2];
-    let user_pda = &accounts[3];    // source owner / PDA signer
-    let company_pda = &accounts[4]; // destination owner
-    let fee_payer = &accounts[5];
-    let system_program = &accounts[6];
+    let user_pda = &accounts[3];    // owner of the input leaves / PDA signer
+    let company_pda = &accounts[4]; // output 0
     let compressed_token_program = &accounts[7];
+    let cpi_accounts = &accounts[U2C_V1_CPI_ACCOUNTS_START..];
 
     // ── Parse instruction data ──────────────────────────────────────────
     let user_id_u64 = parse_u64(data, 0)?;
@@ -53,9 +74,8 @@ pub fn process(
     let amount = parse_u64(data, 16)?;
     let user_bump = parse_u8(data, 24)?;
     let company_bump = parse_u8(data, 25)?;
-    let (memo, _) = parse_string(data, 26)?;
-    // Remaining bytes (if any): ValidityProof + InputTokenDataWithContext from Photon
-    // — accepted in instruction data per AC3, not consumed by on-chain program.
+    let (memo, v1_offset) = parse_string(data, 26)?;
+    let v1_data = &data[v1_offset..];
 
     // ── Input validation ────────────────────────────────────────────────
     if amount == 0 {
@@ -79,25 +99,19 @@ pub fn process(
     validate_id_pda(user_pda.address(), USER_SEED, user_id_u64, user_bump, program_id)?;
     validate_id_pda(company_pda.address(), COMPANY_SEED, company_id_u64, company_bump, program_id)?;
 
-    // ── CPI: compressed transfer (user_pda signs) ───────────────────────
+    // ── The V1 payload must move exactly `amount` to the company ────────
+    let legs = [V1Leg { owner: company_pda.address(), amount }];
+    validate_v1_transfer_payload(v1_data, mint.address(), user_pda.address(), &legs)?;
+    validate_v1_authority(cpi_accounts, user_pda)?;
+
+    // ── CPI: V1 TRANSFER user → company (+ change), user PDA signs ──────
     let user_bump_bytes = [user_bump];
     let signer_seeds: [Seed; 3] = [
         Seed::from(USER_SEED),
         Seed::from(user_id_bytes.as_ref()),
         Seed::from(user_bump_bytes.as_ref()),
     ];
-    let signer = Signer::from(&signer_seeds);
-
-    cpi_compressed_transfer(
-        compressed_token_program,
-        fee_payer,
-        user_pda,    // source
-        company_pda, // destination
-        user_pda,    // authority (source PDA signs)
-        system_program,
-        amount,
-        &[signer],
-    )
+    invoke_v1_transfer_signed(cpi_accounts, user_pda, v1_data, &[Signer::from(&signer_seeds)])
 }
 
 #[cfg(test)]

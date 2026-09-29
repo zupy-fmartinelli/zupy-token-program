@@ -7,6 +7,7 @@ use mollusk_svm::Mollusk;
 use mollusk_svm::result::InstructionResult;
 use solana_account::Account;
 use solana_instruction::error::InstructionError;
+use solana_instruction::AccountMeta;
 use solana_pubkey::Pubkey;
 
 use zupy_token_program::constants::{
@@ -346,6 +347,85 @@ pub fn build_leaf_proof_wire() -> Vec<u8> {
     buf.push(0); // prove_by_index
     buf.extend_from_slice(&[9u8; 128]); // proof
     buf
+}
+
+/// V1 TRANSFER discriminator of the Light cToken (`sha256("global:transfer")[..8]`).
+pub const V1_TRANSFER_DISC: [u8; 8] = [163, 52, 200, 231, 140, 3, 69, 186];
+
+/// One input leaf of a V1 TRANSFER payload.
+#[derive(Clone, Copy)]
+pub struct V1Input {
+    pub amount: u64,
+    pub tree_index: u8,
+    pub queue_index: u8,
+    pub leaf_index: u32,
+    pub prove_by_index: bool,
+    pub root_index: u16,
+}
+
+impl V1Input {
+    /// Leaf in a V1 tree (proof required), packed at remaining[0]/[1].
+    pub fn with_proof(amount: u64) -> Self {
+        V1Input { amount, tree_index: 0, queue_index: 1, leaf_index: 42, prove_by_index: false, root_index: 3 }
+    }
+}
+
+/// Build the cToken V1 TRANSFER payload for compressed → compressed
+/// (`disc | u32 len | Borsh CompressedTokenInstructionDataTransfer`), the same
+/// bytes the backend's `_build_v1_transfer_compressed_data` produces, with N
+/// outputs `(owner, amount, merkle_tree_index)`. `proof = None` for
+/// prove-by-index inputs.
+pub fn build_v1_transfer(
+    mint: &Pubkey,
+    proof: Option<[u8; 128]>,
+    inputs: &[V1Input],
+    outputs: &[(Pubkey, u64, u8)],
+) -> Vec<u8> {
+    let mut inner = Vec::new();
+    match proof {
+        Some(p) => {
+            inner.push(1);
+            inner.extend_from_slice(&p);
+        }
+        None => inner.push(0),
+    }
+    inner.extend_from_slice(mint.as_ref());
+    inner.push(0); // delegated_transfer: None
+    inner.extend_from_slice(&(inputs.len() as u32).to_le_bytes());
+    for i in inputs {
+        inner.extend_from_slice(&i.amount.to_le_bytes());
+        inner.push(0); // delegate_index: None
+        inner.push(i.tree_index);
+        inner.push(i.queue_index);
+        inner.extend_from_slice(&i.leaf_index.to_le_bytes());
+        inner.push(i.prove_by_index as u8);
+        inner.extend_from_slice(&i.root_index.to_le_bytes());
+        inner.push(0); // lamports: None
+        inner.push(0); // tlv: None
+    }
+    inner.extend_from_slice(&(outputs.len() as u32).to_le_bytes());
+    for (owner, amount, tree) in outputs {
+        inner.extend_from_slice(owner.as_ref());
+        inner.extend_from_slice(&amount.to_le_bytes());
+        inner.push(0); // lamports: None
+        inner.push(*tree);
+        inner.push(0); // tlv: None
+    }
+    inner.push(0); // is_compress: false
+    inner.push(0); // compress_or_decompress_amount: None
+    inner.push(0); // cpi_context: None
+    inner.push(0); // lamports_change_account_merkle_tree_index: None
+    let mut data = Vec::from(V1_TRANSFER_DISC.as_slice());
+    data.extend_from_slice(&(inner.len() as u32).to_le_bytes());
+    data.extend_from_slice(&inner);
+    data
+}
+
+/// Minimal V1 CPI account tail for Mollusk: `[fee_payer (w,s), authority (r)]`.
+/// Enough to pass the program's checks and reach the cToken CPI (which basic
+/// Mollusk does not load → `UnsupportedProgramId`).
+pub fn v1_cpi_tail_metas(fee_payer: &Pubkey, authority: &Pubkey) -> Vec<AccountMeta> {
+    vec![AccountMeta::new(*fee_payer, true), AccountMeta::new_readonly(*authority, false)]
 }
 
 /// Build a length-prefixed string (4-byte LE length + UTF-8).

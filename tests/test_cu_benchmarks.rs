@@ -322,7 +322,6 @@ fn setup_transfer_u2c() -> (Instruction, Vec<(Pubkey, Account)>) {
     let (company_pda, company_bump) = derive_company_pda(company_id);
     let fee_payer = Pubkey::new_unique();
     let ctoken_prog = Pubkey::new_from_array(LIGHT_COMPRESSED_TOKEN_PROGRAM_ID);
-    let ctoken_auth = derive_ctoken_authority();
 
     let ts_data = make_transfer_token_state(&transfer_auth, &mint, &pool_ata, bump, true, false);
 
@@ -335,13 +334,17 @@ fn setup_transfer_u2c() -> (Instruction, Vec<(Pubkey, Account)>) {
     payload.push(user_bump);
     payload.push(company_bump);
     payload.extend_from_slice(&memo);
+    // V1 TRANSFER with proof (story 3.21): company gets `amount`, change to user.
+    payload.extend_from_slice(&build_v1_transfer(
+        &mint, Some([9u8; 128]), &[V1Input::with_proof(3_000_000)],
+        &[(company_pda, amount, 0), (user_pda, 2_000_000, 0)],
+    ));
     let data = build_ix_data(&DISC_TRANSFER_USER_TO_COMPANY, &payload);
 
-    // 9-account compressed layout (Path B: compressed → compressed)
     // [0] transfer_authority [1] token_state [2] mint [3] user_pda (src)
     // [4] company_pda (dst) [5] fee_payer [6] system_program
-    // [7] compressed_token_program [8] compressed_token_authority
-    let metas = vec![
+    // [7] compressed_token_program [8+] V1 cToken CPI accounts
+    let mut metas = vec![
         AccountMeta::new(transfer_auth, true),
         AccountMeta::new_readonly(token_state_pda, false),
         AccountMeta::new_readonly(mint, false),
@@ -350,8 +353,8 @@ fn setup_transfer_u2c() -> (Instruction, Vec<(Pubkey, Account)>) {
         AccountMeta::new(fee_payer, true),
         AccountMeta::new_readonly(system_program_id(), false),
         AccountMeta::new_readonly(ctoken_prog, false),
-        AccountMeta::new_readonly(ctoken_auth, false),
     ];
+    metas.extend(v1_cpi_tail_metas(&fee_payer, &user_pda));
 
     let accounts = vec![
         (transfer_auth, make_system_account(10_000_000)),
@@ -362,7 +365,6 @@ fn setup_transfer_u2c() -> (Instruction, Vec<(Pubkey, Account)>) {
         (fee_payer, make_system_account(10_000_000)),
         make_program_stub(&system_program_id()),
         make_program_stub(&ctoken_prog),
-        (ctoken_auth, make_system_account(1_000_000)),
     ];
 
     (Instruction::new_with_bytes(program_id(), &data, metas), accounts)
@@ -373,6 +375,8 @@ fn test_cu_transfer_user_to_company_happy_path() {
     let mollusk = setup_mollusk();
     let (ix, accounts) = setup_transfer_u2c();
     let result = run_benchmark(&mollusk, &ix, &accounts);
+    // Must reach the V1 cToken CPI (not loaded in Mollusk): every check passed.
+    assert_eq!(result.raw_result, Err(solana_instruction::error::InstructionError::UnsupportedProgramId));
     println!("transfer_user_to_company    happy-path CU: {}", result.compute_units_consumed);
     assert!(
         result.compute_units_consumed <= MAX_CU_TRANSFER_U2C,
@@ -393,9 +397,8 @@ fn setup_split_transfer() -> (Instruction, Vec<(Pubkey, Account)>) {
     let company_id: u64 = 2;
     let (user_pda, user_bump) = derive_user_pda(user_id);
     let (company_pda, company_bump) = derive_company_pda(company_id);
-    let user_ata = Pubkey::new_unique();
-    let company_ata = Pubkey::new_unique();
-    let incentive_ata = Pubkey::new_unique();
+    let fee_payer = Pubkey::new_unique();
+    let ctoken_prog = Pubkey::new_from_array(LIGHT_COMPRESSED_TOKEN_PROGRAM_ID);
 
     let dummy = Pubkey::new_unique();
     let ts_data = make_token_state_data(
@@ -403,9 +406,11 @@ fn setup_split_transfer() -> (Instruction, Vec<(Pubkey, Account)>) {
         &incentive_pool_pda, &dummy, &mint, bump, true, false,
     );
 
-    // Burn-free explicit-amount layout (AD-A1): company + pool legs.
+    // Burn-free explicit legs (AD-A1) + V1 TRANSFER with proof (story 3.21).
+    // Until 3.21 this fixture still used the pre-compressed ATA layout and
+    // stopped at the cToken-program check, so it never measured the split.
     let company_amount: u64 = 1_000_000;
-    let pool_amount: u64 = 0;
+    let pool_amount: u64 = 50_000;
     let mut payload = Vec::new();
     payload.extend_from_slice(&user_id.to_le_bytes());
     payload.extend_from_slice(&company_id.to_le_bytes());
@@ -415,20 +420,24 @@ fn setup_split_transfer() -> (Instruction, Vec<(Pubkey, Account)>) {
     payload.push(company_bump);
     payload.push(incentive_bump);
     payload.extend_from_slice(&build_string("mixed_payment"));
+    payload.extend_from_slice(&build_v1_transfer(
+        &mint, Some([9u8; 128]), &[V1Input::with_proof(2_000_000)],
+        &[(company_pda, company_amount, 0), (incentive_pool_pda, pool_amount, 0), (user_pda, 950_000, 0)],
+    ));
     let data = build_ix_data(&DISC_EXECUTE_SPLIT_TRANSFER, &payload);
 
-    let metas = vec![
+    let mut metas = vec![
         AccountMeta::new(transfer_auth, true),
         AccountMeta::new_readonly(token_state_pda, false),
-        AccountMeta::new(mint, false),
+        AccountMeta::new_readonly(mint, false),
         AccountMeta::new_readonly(user_pda, false),
         AccountMeta::new_readonly(company_pda, false),
         AccountMeta::new_readonly(incentive_pool_pda, false),
-        AccountMeta::new(user_ata, false),
-        AccountMeta::new(company_ata, false),
-        AccountMeta::new(incentive_ata, false),
-        AccountMeta::new_readonly(token_2022_id(), false),
+        AccountMeta::new(fee_payer, true),
+        AccountMeta::new_readonly(system_program_id(), false),
+        AccountMeta::new_readonly(ctoken_prog, false),
     ];
+    metas.extend(v1_cpi_tail_metas(&fee_payer, &user_pda));
 
     let accounts = vec![
         (transfer_auth, make_system_account(1_000_000)),
@@ -437,10 +446,9 @@ fn setup_split_transfer() -> (Instruction, Vec<(Pubkey, Account)>) {
         (user_pda, make_program_account(vec![], 1_000_000)),
         (company_pda, make_program_account(vec![], 1_000_000)),
         (incentive_pool_pda, make_program_account(vec![], 1_000_000)),
-        (user_ata, make_token_owned_account(make_token_account_data(&mint, &user_pda, 10_000_000))),
-        (company_ata, make_token_owned_account(make_token_account_data(&mint, &company_pda, 0))),
-        (incentive_ata, make_token_owned_account(make_token_account_data(&mint, &incentive_pool_pda, 0))),
-        make_program_stub(&token_2022_id()),
+        (fee_payer, make_system_account(10_000_000)),
+        make_program_stub(&system_program_id()),
+        make_program_stub(&ctoken_prog),
     ];
 
     (Instruction::new_with_bytes(program_id(), &data, metas), accounts)
@@ -451,6 +459,8 @@ fn test_cu_execute_split_transfer_happy_path() {
     let mollusk = setup_mollusk();
     let (ix, accounts) = setup_split_transfer();
     let result = run_benchmark(&mollusk, &ix, &accounts);
+    // Must reach the V1 cToken CPI (not loaded in Mollusk): every check passed.
+    assert_eq!(result.raw_result, Err(solana_instruction::error::InstructionError::UnsupportedProgramId));
     println!("execute_split_transfer      happy-path CU: {}", result.compute_units_consumed);
     assert!(
         result.compute_units_consumed <= MAX_CU_SPLIT_TRANSFER,

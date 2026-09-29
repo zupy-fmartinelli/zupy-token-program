@@ -23,3 +23,6 @@ cobertura.xml
 # SonarQube
 sonar-project.properties
 .scannerwork/
+
+# Mainnet fork fixtures (scripts/fetch-mainnet-fixtures.sh, read-only dumps)
+tests/fixtures/mainnet/

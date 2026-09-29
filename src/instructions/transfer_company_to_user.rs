@@ -1,13 +1,13 @@
 use pinocchio::cpi::{Seed, Signer};
 use pinocchio::{AccountView, Address, ProgramResult};
 use pinocchio::error::ProgramError;
-use pinocchio::instruction::InstructionView;
 
-use crate::constants::{COMPANY_SEED, LIGHT_COMPRESSED_TOKEN_PROGRAM_ID, USER_SEED};
-use crate::helpers::compressed_accounts::{build_metas_forcing_signer, validate_v1_transfer_disc};
+use crate::constants::{COMPANY_SEED, USER_SEED};
+use crate::helpers::compressed_accounts::validate_v1_transfer_disc;
 use crate::helpers::instruction_data::{parse_u64, parse_u8};
 use crate::helpers::pda::validate_pda_with_seeds;
 use crate::helpers::transfer_validation::validate_transfer_common_compressed;
+use crate::helpers::v1_transfer::invoke_v1_transfer_signed;
 
 /// Process `transfer_company_to_user` instruction (V1 CPI passthrough).
 ///
@@ -17,9 +17,16 @@ use crate::helpers::transfer_validation::validate_transfer_common_compressed;
 /// for compressed→compressed transfer) and the V1-ordered account list; this
 /// instruction only validates security invariants before forwarding.
 ///
-/// **Context:** Mainnet cToken program (`cTokenmWW8bLPjZEBAUgYy3zKxQZW6VKi7bqNFEVv3m`)
-/// runs V1 (Anchor 8-byte discriminators). V2 Transfer (disc=3) only works on
-/// devnet. This passthrough enables compressed transfers on mainnet.
+/// **MEASURED 2026-09-29 (story 3.21): WORKS on mainnet.** Public tx
+/// `66bFvExdZpcnXirEXS1br2JoxL56Qk1yE7CAuDWvGabZmPSs9tcussJyRvZpvPRS4t7B7wKfqTNUPdak1mBHxYu8`
+/// (slot 451624459) is a successful call; a 1-in-8 sample of the last 1,000
+/// program signatures (2026-09-24→29) had 68 successful calls and 5 errors.
+/// The mainnet cToken still dispatches the Anchor `global:transfer` (V1) instruction — it sits in the binary as an `lddw`
+/// immediate, which is why a contiguous-byte search wrongly concluded it was
+/// gone. The cToken also runs Transfer2 (disc=101, used by `return_to_pool`).
+/// What does NOT work for compressed Z$ is disc=3 (`cpi_compressed_transfer`):
+/// `Custom(18063) InvalidTokenOwner` (story 3.17). The old wording here ("V2
+/// Transfer only works on devnet") was never measured.
 ///
 /// ## Security Validations
 ///
@@ -104,37 +111,16 @@ pub fn process(
         program_id,
     )?;
 
-    // ── Build CPI instruction for cToken V1 ─────────────────────────────
-    let prog_id: Address = LIGHT_COMPRESSED_TOKEN_PROGRAM_ID.into();
-    let cpi_accounts = &accounts[5..];
-
-    // Build account metas from CPI accounts, forcing company_pda to be signer.
-    // The company_pda is not a signer on the outer transaction (only our program
-    // can sign for it), but it must be a signer in the CPI to the cToken program.
-    // invoke_signed provides this signature via the company PDA seeds.
-    let account_metas = build_metas_forcing_signer(cpi_accounts, company_pda);
-
-    let instruction = InstructionView {
-        program_id: &prog_id,
-        accounts: &account_metas,
-        data: v1_cpi_data,
-    };
-
-    // Build account view slice matching instruction.accounts 1:1.
-    let account_views: Vec<&AccountView> = cpi_accounts.iter().collect();
-
     // ── CPI: Forward V1 TRANSFER to cToken, signing with company PDA ────
+    // company_pda is not a signer on the outer tx; the shared forward forces
+    // its meta to signer and invoke_signed supplies the PDA signature.
     let bump_bytes = [company_bump];
     let signer_seeds: [Seed; 3] = [
         Seed::from(COMPANY_SEED),
         Seed::from(company_id_bytes.as_ref()),
         Seed::from(bump_bytes.as_ref()),
     ];
-    let signer = Signer::from(&signer_seeds);
-
-    pinocchio::cpi::invoke_signed_with_slice(&instruction, &account_views, &[signer])?;
-
-    Ok(())
+    invoke_v1_transfer_signed(&accounts[5..], company_pda, v1_cpi_data, &[Signer::from(&signer_seeds)])
 }
 
 #[cfg(test)]

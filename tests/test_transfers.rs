@@ -1012,14 +1012,145 @@ mod transfer_company_to_user {
         println!("transfer_company_to_user: wrong_user_pda CU={}", result.compute_units_consumed);
     }
 
-    // Note on full-flow test:
-    // A complete compressed-to-compressed integration test requires the Light Protocol
-    // cToken program loaded in Mollusk (via light-program-test or a mock). This is deferred
-    // because the Light Protocol test infrastructure is not available in this environment.
-    // All validation-path tests above verify that:
-    // - Account count check updated to 9 (was 10) — ATAs removed, fee_payer + ctoken_prog added
-    // - All error paths before the CPI work correctly with the new compressed account layout
-    // Full CPI path is validated on devnet via manual transaction testing.
+    // ── V1 TRANSFER with proof (story 3.21) ─────────────────────────────
+    //
+    // Since 3.21 the instruction forwards the backend's V1 TRANSFER (with
+    // validity proof) appended after the memo; V1 CPI accounts start at [8].
+    // Basic Mollusk has no cToken, so "success" = every check passed and the
+    // CPI was attempted (UnsupportedProgramId). Real binaries: tests/test_mainnet_fork.rs.
+
+    struct U2c {
+        transfer_auth: Pubkey,
+        token_state_pda: Pubkey,
+        bump: u8,
+        mint: Pubkey,
+        user_pda: Pubkey,
+        user_bump: u8,
+        company_pda: Pubkey,
+        company_bump: u8,
+        fee_payer: Pubkey,
+    }
+
+    fn u2c_setup() -> U2c {
+        let (token_state_pda, bump) = derive_token_state_pda();
+        let (user_pda, user_bump) = derive_user_pda(1);
+        let (company_pda, company_bump) = derive_company_pda(2);
+        U2c {
+            transfer_auth: Pubkey::new_unique(), token_state_pda, bump, mint: Pubkey::new_unique(),
+            user_pda, user_bump, company_pda, company_bump, fee_payer: Pubkey::new_unique(),
+        }
+    }
+
+    fn u2c_ix(t: &U2c, amount: u64, v1: &[u8], cpi_authority: &Pubkey) -> (Instruction, Vec<(Pubkey, Account)>) {
+        let ctoken_prog = ctoken_program_id();
+        let ts_data = make_transfer_token_state(&t.transfer_auth, &t.mint, &Pubkey::new_unique(), t.bump, true, false);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u64.to_le_bytes());
+        payload.extend_from_slice(&2u64.to_le_bytes());
+        payload.extend_from_slice(&amount.to_le_bytes());
+        payload.push(t.user_bump);
+        payload.push(t.company_bump);
+        payload.extend_from_slice(&build_string("zupy:v1:u2c:1:2"));
+        payload.extend_from_slice(v1);
+        let data = build_ix_data(&DISC_TRANSFER_USER_TO_COMPANY, &payload);
+        let mut metas = build_ix_metas(&t.transfer_auth, &t.token_state_pda, &t.mint, &t.user_pda, &t.company_pda, &t.fee_payer, &ctoken_prog);
+        metas.truncate(8); // [8] is the start of the V1 CPI tail now
+        metas.extend(v1_cpi_tail_metas(&t.fee_payer, cpi_authority));
+        let mut accounts = build_accounts(&t.transfer_auth, &t.token_state_pda, ts_data, &t.mint, &t.user_pda, &t.company_pda, &t.fee_payer, &ctoken_prog);
+        if !accounts.iter().any(|(k, _)| k == cpi_authority) {
+            accounts.push((*cpi_authority, make_system_account(0)));
+        }
+        (Instruction::new_with_bytes(program_id(), &data, metas), accounts)
+    }
+
+    fn u2c_v1(t: &U2c, leaf: u64, to_company: u64, change: u64) -> Vec<u8> {
+        let mut outs = vec![(t.company_pda, to_company, 0u8)];
+        if change > 0 {
+            outs.push((t.user_pda, change, 0));
+        }
+        build_v1_transfer(&t.mint, Some([9u8; 128]), &[V1Input::with_proof(leaf)], &outs)
+    }
+
+    #[test]
+    fn test_v1_flow_reaches_cpi_stage() {
+        let mollusk = setup_mollusk();
+        let t = u2c_setup();
+        let (ix, accounts) = u2c_ix(&t, 1_000_000, &u2c_v1(&t, 3_000_000, 1_000_000, 2_000_000), &t.user_pda);
+        let result = mollusk.process_instruction(&ix, &accounts);
+        assert_eq!(result.raw_result, Err(InstructionError::UnsupportedProgramId));
+        println!("transfer_user_to_company: V1 flow CU={} (reaches cToken CPI)", result.compute_units_consumed);
+    }
+
+    #[test]
+    fn test_v1_whole_leaf_without_change_reaches_cpi() {
+        let mollusk = setup_mollusk();
+        let t = u2c_setup();
+        let (ix, accounts) = u2c_ix(&t, 1_000_000, &u2c_v1(&t, 1_000_000, 1_000_000, 0), &t.user_pda);
+        let result = mollusk.process_instruction(&ix, &accounts);
+        assert_eq!(result.raw_result, Err(InstructionError::UnsupportedProgramId));
+    }
+
+    /// The 396df04 adapter stops after the memo: fail closed before any CPI
+    /// (it used to reach the disc=3 CPI and die with 18063 on mainnet).
+    #[test]
+    fn test_header_only_payload_fails_before_cpi() {
+        let mollusk = setup_mollusk();
+        let t = u2c_setup();
+        let (ix, accounts) = u2c_ix(&t, 1_000_000, &[], &t.user_pda);
+        let result = mollusk.process_instruction(&ix, &accounts);
+        assert_eq!(result.raw_result, Err(InstructionError::InvalidInstructionData));
+    }
+
+    #[test]
+    fn test_v1_insufficient_balance() {
+        let mollusk = setup_mollusk();
+        let t = u2c_setup();
+        let v1 = build_v1_transfer(&t.mint, Some([9u8; 128]), &[V1Input::with_proof(999_999)], &[(t.company_pda, 1_000_000, 0)]);
+        let (ix, accounts) = u2c_ix(&t, 1_000_000, &v1, &t.user_pda);
+        let result = mollusk.process_instruction(&ix, &accounts);
+        assert_ix_custom_err(&result, 6004); // InsufficientBalance
+    }
+
+    #[test]
+    fn test_v1_amount_disagrees_with_header() {
+        let mollusk = setup_mollusk();
+        let t = u2c_setup();
+        let (ix, accounts) = u2c_ix(&t, 1_000_000, &u2c_v1(&t, 3_000_000, 1_500_000, 1_500_000), &t.user_pda);
+        let result = mollusk.process_instruction(&ix, &accounts);
+        assert_ix_custom_err(&result, 6005); // InvalidAmount
+    }
+
+    #[test]
+    fn test_v1_change_to_third_party_rejected() {
+        let mollusk = setup_mollusk();
+        let t = u2c_setup();
+        let v1 = build_v1_transfer(
+            &t.mint, Some([9u8; 128]), &[V1Input::with_proof(3_000_000)],
+            &[(t.company_pda, 1_000_000, 0), (Pubkey::new_unique(), 2_000_000, 0)],
+        );
+        let (ix, accounts) = u2c_ix(&t, 1_000_000, &v1, &t.user_pda);
+        let result = mollusk.process_instruction(&ix, &accounts);
+        assert_ix_custom_err(&result, ERR_INVALID_PDA);
+    }
+
+    #[test]
+    fn test_v1_cpi_authority_must_be_user_pda() {
+        let mollusk = setup_mollusk();
+        let t = u2c_setup();
+        let (ix, accounts) = u2c_ix(&t, 1_000_000, &u2c_v1(&t, 3_000_000, 1_000_000, 2_000_000), &t.company_pda);
+        let result = mollusk.process_instruction(&ix, &accounts);
+        assert_ix_custom_err(&result, ERR_INVALID_PDA);
+    }
+
+    #[test]
+    fn test_v1_missing_cpi_accounts() {
+        let mollusk = setup_mollusk();
+        let t = u2c_setup();
+        let (mut ix, accounts) = u2c_ix(&t, 1_000_000, &u2c_v1(&t, 3_000_000, 1_000_000, 2_000_000), &t.user_pda);
+        ix.accounts.truncate(9); // only fee_payer of the V1 tail, no authority
+        let result = mollusk.process_instruction(&ix, &accounts);
+        assert_ix_not_enough_keys(&result);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1563,12 +1694,19 @@ fn test_cu_benchmark_validation_paths() {
         payload.push(user_bump);
         payload.push(company_bump);
         payload.extend_from_slice(&memo);
+        // V1 TRANSFER with proof (story 3.21)
+        payload.extend_from_slice(&build_v1_transfer(
+            &mint, Some([9u8; 128]), &[V1Input::with_proof(3_000_000)],
+            &[(company_pda, amount, 0), (user_pda, 2_000_000, 0)],
+        ));
         let data = build_ix_data(&DISC_TRANSFER_USER_TO_COMPANY, &payload);
 
-        let metas = transfer_user_to_company::build_ix_metas(
+        let mut metas = transfer_user_to_company::build_ix_metas(
             &transfer_auth, &token_state_pda, &mint, &user_pda,
             &company_pda, &fee_payer_u2c, &ctoken_prog_u2c,
         );
+        metas.truncate(8);
+        metas.extend(v1_cpi_tail_metas(&fee_payer_u2c, &user_pda));
         let instruction = Instruction::new_with_bytes(program_id(), &data, metas);
         let accounts = transfer_user_to_company::build_accounts(
             &transfer_auth, &token_state_pda, ts_data, &mint,
@@ -1576,6 +1714,7 @@ fn test_cu_benchmark_validation_paths() {
         );
 
         let result = mollusk.process_instruction(&instruction, &accounts);
+        assert_eq!(result.raw_result, Err(InstructionError::UnsupportedProgramId));
         println!("  transfer_user_to_company CU: {:>6}  (validation + CPI attempt)", result.compute_units_consumed);
         assert!(
             result.compute_units_consumed <= CU_VALIDATION_THRESHOLD,
