@@ -41,6 +41,9 @@ use solana_pubkey::Pubkey;
 const DISC_SPLIT: [u8; 8] = [51, 254, 61, 214, 234, 138, 101, 214];
 const DISC_U2C: [u8; 8] = [186, 233, 22, 40, 87, 223, 252, 131];
 const DISC_C2U: [u8; 8] = [8, 143, 213, 13, 143, 247, 145, 33];
+const DISC_CONSOLIDATE: [u8; 8] = [131, 243, 51, 130, 117, 203, 4, 156];
+const OWNER_USER: u8 = 0;
+const OWNER_COMPANY: u8 = 1;
 
 // Real mainnet ids (public; the same pair the 3.17 simulation used).
 const USER_ID: u64 = 2_140_389_439_281_718_293;
@@ -275,6 +278,62 @@ impl Fork {
         ))
     }
 
+    /// `transfer_company_to_user` in the NEW layout (story 3.40): explicit
+    /// amount + memo, accounts mirror user → company, CPI tail from [8].
+    fn company_to_user_new(&self, amount: u64, memo: &str, v1: &[u8]) -> InstructionResult {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&COMPANY_ID.to_le_bytes());
+        payload.extend_from_slice(&USER_ID.to_le_bytes());
+        payload.extend_from_slice(&amount.to_le_bytes());
+        payload.extend_from_slice(&[self.company_bump, self.user_bump]);
+        payload.extend_from_slice(&build_string(memo));
+        payload.extend_from_slice(v1);
+        let mut accounts = vec![
+            AccountMeta::new(transfer_authority(), true),
+            AccountMeta::new_readonly(token_state(), false),
+            AccountMeta::new_readonly(zupy_mint(), false),
+            AccountMeta::new_readonly(self.company_pda, false),
+            AccountMeta::new_readonly(self.user_pda, false),
+            AccountMeta::new(transfer_authority(), true),
+            AccountMeta::new_readonly(system(), false),
+            AccountMeta::new_readonly(ctoken(), false),
+        ];
+        accounts.extend(self.v1_cpi_accounts(&self.company_pda, false));
+        self.ctx.process_instruction(&Instruction::new_with_bytes(
+            program_id(), &build_ix_data(&DISC_C2U, &payload), accounts,
+        ))
+    }
+
+    /// `consolidate_leaves` (story 3.40) for the user or the company PDA.
+    fn consolidate(&self, kind: u8, amount: u64, v1: &[u8]) -> InstructionResult {
+        let (id, bump, owner) = if kind == OWNER_COMPANY {
+            (COMPANY_ID, self.company_bump, self.company_pda)
+        } else {
+            (USER_ID, self.user_bump, self.user_pda)
+        };
+        let mut payload = vec![kind];
+        payload.extend_from_slice(&id.to_le_bytes());
+        payload.push(bump);
+        payload.extend_from_slice(&amount.to_le_bytes());
+        payload.extend_from_slice(&build_string("zupy:v1:consolidate:fork"));
+        payload.extend_from_slice(v1);
+        let mut accounts = vec![
+            AccountMeta::new(transfer_authority(), true),
+            AccountMeta::new_readonly(token_state(), false),
+            AccountMeta::new_readonly(zupy_mint(), false),
+            AccountMeta::new_readonly(owner, false),
+        ];
+        accounts.extend(self.v1_cpi_accounts(&owner, false));
+        self.ctx.process_instruction(&Instruction::new_with_bytes(
+            program_id(), &build_ix_data(&DISC_CONSOLIDATE, &payload), accounts,
+        ))
+    }
+
+    /// Mint `amounts.len()` fresh leaves to `owner`; returns their inputs.
+    fn mint_leaves(&self, owner: &Pubkey, amounts: &[u64]) -> Vec<V1Input> {
+        amounts.iter().map(|a| Self::input(*a, self.mint_leaf(owner, *a))).collect()
+    }
+
     /// Spend a pool-owned leaf directly at the cToken (Mollusk does not verify
     /// signatures, so the pool PDA can be marked signer) — effect probe only.
     fn pool_self_transfer(&self, amount: u64, leaf_index: u32) -> InstructionResult {
@@ -396,4 +455,206 @@ fn failure_modes_with_real_ctoken() {
         &[(f.company_pda, 800_000_000, 1), (f.pool_pda, 40_000_000, 1), (f.user_pda, 160_000_000, 1)],
     );
     ok(&f.split(800_000_000, 40_000_000, &good), "split after the rejected attempts");
+}
+
+// ── Story 3.40 — consolidate_leaves ─────────────────────────────────────────
+
+/// N user leaves → ONE user leaf with the exact sum (N = 2, 4, 8), against the
+/// real cToken/Light. Effect: the merged leaf is spendable by the user with the
+/// sum (and not with sum + 1); the input leaves cannot be spent again.
+#[test]
+#[ignore = "needs scripts/fetch-mainnet-fixtures.sh + mainnet build"]
+fn consolidate_user_leaves_2_4_8_with_real_ctoken() {
+    for n in [2usize, 4, 8] {
+        let f = fork();
+        let amounts: Vec<u64> = (1..=n as u64).map(|i| i * 1_000_000 + 7).collect();
+        let total: u64 = amounts.iter().sum();
+        let inputs = f.mint_leaves(&f.user_pda, &amounts);
+        let v1 = build_v1_transfer(&zupy_mint(), None, &inputs, &[(f.user_pda, total, 1)]);
+        let before = f.next_leaf_index();
+        let r = f.consolidate(OWNER_USER, total, &v1);
+        ok(&r, "consolidate_leaves (user)");
+        println!("consolidate_leaves user N={n} (real cToken + Light, prove-by-index): {} CU", r.compute_units_consumed);
+        assert_eq!(f.next_leaf_index(), before + 1, "exactly ONE new leaf");
+        let merged = before;
+
+        // The inputs are spent: the same consolidation cannot run twice.
+        err(&f.consolidate(OWNER_USER, total, &v1), "double spend of the consolidated inputs");
+
+        // The merged leaf holds exactly `total` for the user PDA.
+        let lie = build_v1_transfer(&zupy_mint(), None, &[Fork::input(total + 1, merged)], &[(f.company_pda, total + 1, 1)]);
+        err(&f.user_to_company(total + 1, &lie), "merged leaf with a wrong amount");
+        let spend = build_v1_transfer(&zupy_mint(), None, &[Fork::input(total, merged)], &[(f.company_pda, total, 1)]);
+        ok(&f.user_to_company(total, &spend), "user spends the merged leaf (exact sum)");
+    }
+}
+
+/// Company leaves → ONE company leaf; then the store pays a reward from it
+/// through the hardened transfer_company_to_user (new layout, with memo).
+#[test]
+#[ignore = "needs scripts/fetch-mainnet-fixtures.sh + mainnet build"]
+fn consolidate_company_leaves_then_reward_with_real_ctoken() {
+    let f = fork();
+    let amounts = [3_000_000u64, 2_000_000, 1_000_000, 500_000];
+    let total: u64 = amounts.iter().sum();
+    let inputs = f.mint_leaves(&f.company_pda, &amounts);
+    let v1 = build_v1_transfer(&zupy_mint(), None, &inputs, &[(f.company_pda, total, 1)]);
+    let merged = f.next_leaf_index();
+    let r = f.consolidate(OWNER_COMPANY, total, &v1);
+    ok(&r, "consolidate_leaves (company, 4 leaves)");
+    println!("consolidate_leaves company N=4: {} CU", r.compute_units_consumed);
+
+    // A reward bigger than any single original leaf, paid from the merged one.
+    let reward = 5_000_000u64;
+    let pay = build_v1_transfer(
+        &zupy_mint(), None, &[Fork::input(total, merged)],
+        &[(f.user_pda, reward, 1), (f.company_pda, total - reward, 1)],
+    );
+    let r = f.company_to_user_new(reward, "zupy:v1:ztransaction:340", &pay);
+    ok(&r, "transfer_company_to_user (new layout) from the merged leaf");
+    println!("transfer_company_to_user new layout (real cToken + Light, 2 outputs): {} CU", r.compute_units_consumed);
+    let (user_leaf, change_leaf) = (merged + 1, merged + 2);
+
+    // Effect: the user leaf is the user's (exact), the change is the company's (exact).
+    let u = build_v1_transfer(&zupy_mint(), None, &[Fork::input(reward, user_leaf)], &[(f.company_pda, reward, 1)]);
+    ok(&f.user_to_company(reward, &u), "user spends the reward leaf");
+    let c = build_v1_transfer(&zupy_mint(), None, &[Fork::input(total - reward, change_leaf)], &[(f.user_pda, total - reward, 1)]);
+    ok(&f.company_to_user(&c), "company spends its change leaf (legacy layout still accepted)");
+}
+
+/// What the program refuses before the CPI, and what the real cToken refuses
+/// after it (leaves of another owner, an inflated leaf).
+#[test]
+#[ignore = "needs scripts/fetch-mainnet-fixtures.sh + mainnet build"]
+fn consolidate_failure_modes_with_real_ctoken() {
+    let f = fork();
+    let inputs = f.mint_leaves(&f.user_pda, &[1_000_000, 2_000_000]);
+    let total = 3_000_000u64;
+
+    // Output to another owner → InvalidPDA (6007).
+    let v = build_v1_transfer(&zupy_mint(), None, &inputs, &[(f.company_pda, total, 1)]);
+    assert_ix_custom_err(&f.consolidate(OWNER_USER, total, &v), 6007);
+    // Output different from the declared amount → InvalidAmount (6005).
+    let v = build_v1_transfer(&zupy_mint(), None, &inputs, &[(f.user_pda, total, 1)]);
+    assert_ix_custom_err(&f.consolidate(OWNER_USER, total - 1, &v), 6005);
+    // Extra output (even to the owner) → InvalidInstructionData.
+    let v = build_v1_transfer(&zupy_mint(), None, &inputs, &[(f.user_pda, 2_000_000, 1), (f.user_pda, 1_000_000, 1)]);
+    assert_eq!(f.consolidate(OWNER_USER, 2_000_000, &v).raw_result, Err(solana_instruction::error::InstructionError::InvalidInstructionData));
+    // Wrong mint → InvalidMint (6011).
+    let v = build_v1_transfer(&Pubkey::new_unique(), None, &inputs, &[(f.user_pda, total, 1)]);
+    assert_ix_custom_err(&f.consolidate(OWNER_USER, total, &v), 6011);
+    // Sum of inputs above the output (a burn) → SplitCalculationError (6029).
+    let v = build_v1_transfer(&zupy_mint(), None, &inputs, &[(f.user_pda, total - 1, 1)]);
+    assert_ix_custom_err(&f.consolidate(OWNER_USER, total - 1, &v), 6029);
+
+    // Leaves of ANOTHER owner (the company's), consolidated as the user: the
+    // payload is consistent, the program signs only for the user PDA, and the
+    // real cToken/Light reject it — the leaf hash commits to its owner.
+    let foreign = f.mint_leaves(&f.company_pda, &[1_000_000, 2_000_000]);
+    let v = build_v1_transfer(&zupy_mint(), None, &foreign, &[(f.user_pda, total, 1)]);
+    // 14307 = InclusionProofByIndexFailed, raised inside account compression.
+    assert_ix_custom_err(&f.consolidate(OWNER_USER, total, &v), 14307);
+
+    // Inflated input leaf: consistent payload, rejected by the real cToken/Light.
+    let mut inflated = inputs.clone();
+    inflated[0].amount += 1;
+    let v = build_v1_transfer(&zupy_mint(), None, &inflated, &[(f.user_pda, total + 1, 1)]);
+    assert_ix_custom_err(&f.consolidate(OWNER_USER, total + 1, &v), 14307);
+
+    // After all the refusals the user's leaves are intact: the right consolidation works.
+    let v = build_v1_transfer(&zupy_mint(), None, &inputs, &[(f.user_pda, total, 1)]);
+    ok(&f.consolidate(OWNER_USER, total, &v), "consolidation after the rejected attempts");
+}
+
+// ── Story 3.40 — transfer_company_to_user hardened ──────────────────────────
+
+/// Both layouts pay the user with the real cToken; the payloads a compromised
+/// backend could send (change to a third party, a burn, a lie about the amount,
+/// a bad memo) are refused BEFORE the CPI.
+#[test]
+#[ignore = "needs scripts/fetch-mainnet-fixtures.sh + mainnet build"]
+fn company_to_user_hardened_with_real_ctoken() {
+    let f = fork();
+    let leaf = f.mint_leaf(&f.company_pda, 10_000_000);
+    let good = build_v1_transfer(
+        &zupy_mint(), None, &[Fork::input(10_000_000, leaf)],
+        &[(f.user_pda, 4_000_000, 1), (f.company_pda, 6_000_000, 1)],
+    );
+    let thief = Pubkey::new_unique();
+    let steal = build_v1_transfer(
+        &zupy_mint(), None, &[Fork::input(10_000_000, leaf)],
+        &[(f.user_pda, 4_000_000, 1), (thief, 6_000_000, 1)],
+    );
+    let burn = build_v1_transfer(
+        &zupy_mint(), None, &[Fork::input(10_000_000, leaf)], &[(f.user_pda, 4_000_000, 1)],
+    );
+
+    // Refused before the CPI, both layouts.
+    assert_ix_custom_err(&f.company_to_user(&steal), 6007);
+    assert_ix_custom_err(&f.company_to_user_new(4_000_000, "zupy:v1:ztransaction:1", &steal), 6007);
+    assert_ix_custom_err(&f.company_to_user(&burn), 6029);
+    assert_ix_custom_err(&f.company_to_user_new(3_000_000, "zupy:v1:ztransaction:1", &good), 6005);
+    assert_ix_custom_err(&f.company_to_user_new(4_000_000, "ztransaction-1", &good), 6009);
+    assert_eq!(
+        f.company_to_user_new(4_000_000, "zupy:v1:ztransaction:1", &[]).raw_result,
+        Err(solana_instruction::error::InstructionError::InvalidInstructionData),
+    );
+
+    // The leaf is intact after the refusals: the new layout pays the user.
+    let r = f.company_to_user_new(4_000_000, "zupy:v1:ztransaction:1", &good);
+    ok(&r, "transfer_company_to_user new layout");
+    let (user_leaf, change_leaf) = (leaf + 1, leaf + 2);
+    let u = build_v1_transfer(&zupy_mint(), None, &[Fork::input(4_000_000, user_leaf)], &[(f.company_pda, 4_000_000, 1)]);
+    ok(&f.user_to_company(4_000_000, &u), "user spends the reward leaf (exact)");
+
+    // And the legacy layout (what the backend sends today) pays from the change.
+    let legacy = build_v1_transfer(
+        &zupy_mint(), None, &[Fork::input(6_000_000, change_leaf)],
+        &[(f.user_pda, 1_000_000, 1), (f.company_pda, 5_000_000, 1)],
+    );
+    let r = f.company_to_user(&legacy);
+    ok(&r, "transfer_company_to_user legacy layout (hardened)");
+    println!("transfer_company_to_user legacy layout (real cToken + Light, 2 outputs): {} CU", r.compute_units_consumed);
+}
+
+/// Story 3.40 regression on REAL traffic: every recent successful mainnet
+/// `transfer_company_to_user` (legacy layout, what the backend sends today —
+/// `3-40-evidence/c2u_real_payloads.py.txt` writes the fixture) still passes
+/// the hardened checks: legacy layout detected, PDAs derive from the header,
+/// output 0 = user PDA with amount > 0, change only to the company, CPI
+/// authority = company PDA, full payload validation.
+#[test]
+#[ignore = "needs tests/fixtures/mainnet/c2u_recent.txt (3-40-evidence/c2u_real_payloads.py.txt)"]
+fn real_mainnet_company_to_user_payloads_pass_the_hardened_validator() {
+    use pinocchio::Address;
+    use zupy_token_program::helpers::v1_transfer::{v1_first_output, validate_v1_transfer_payload, V1Leg};
+
+    let text = std::fs::read_to_string(fixtures().join("c2u_recent.txt")).expect("run c2u_real_payloads.py.txt");
+    let mut n = 0;
+    for line in text.lines().filter(|l| !l.trim().is_empty() && !l.starts_with('#')) {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let data: Vec<u8> = (0..f[0].len()).step_by(2).map(|i| u8::from_str_radix(&f[0][i..i + 2], 16).unwrap()).collect();
+        let (mint, company, user, cpi_authority) = (pk(f[1]), pk(f[2]), pk(f[3]), pk(f[4]));
+        assert_eq!(&data[..8], &DISC_C2U);
+        let body = &data[8..];
+        assert_eq!(&body[18..26], &V1_TRANSFER_DISC, "{}: legacy layout must be detected", f[5]);
+
+        let company_id = u64::from_le_bytes(body[0..8].try_into().unwrap());
+        let user_id = u64::from_le_bytes(body[8..16].try_into().unwrap());
+        assert_eq!(derive_company_pda(company_id), (company, body[16]), "{}: company PDA", f[5]);
+        assert_eq!(derive_user_pda(user_id), (user, body[17]), "{}: user PDA", f[5]);
+        assert_eq!(cpi_authority, company, "{}: CPI authority = company PDA", f[5]);
+
+        let v1 = &body[18..];
+        let (owner, amount) = v1_first_output(v1).unwrap();
+        assert_eq!(owner, user.as_ref(), "{}: output 0 is the user", f[5]);
+        assert!(amount > 0);
+        let (mint_a, company_a, user_a) =
+            (Address::from(mint.to_bytes()), Address::from(company.to_bytes()), Address::from(user.to_bytes()));
+        let legs = [V1Leg { owner: &user_a, amount }];
+        assert_eq!(validate_v1_transfer_payload(v1, &mint_a, &company_a, &legs), Ok(()), "{}", f[5]);
+        n += 1;
+    }
+    println!("{n} real mainnet transfer_company_to_user payloads pass the hardened validator");
+    assert!(n > 0);
 }

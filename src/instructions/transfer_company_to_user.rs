@@ -3,58 +3,70 @@ use pinocchio::{AccountView, Address, ProgramResult};
 use pinocchio::error::ProgramError;
 
 use crate::constants::{COMPANY_SEED, USER_SEED};
-use crate::helpers::compressed_accounts::validate_v1_transfer_disc;
-use crate::helpers::instruction_data::{parse_u64, parse_u8};
-use crate::helpers::pda::validate_pda_with_seeds;
+use crate::error::ZupyTokenError;
+use crate::helpers::compressed_accounts::TRANSFER_V1_DISC;
+use crate::helpers::instruction_data::{parse_string, parse_u64, parse_u8};
+use crate::helpers::memo::validate_memo_format;
+use crate::helpers::pda::{validate_id_pda, validate_light_ctoken_program};
 use crate::helpers::transfer_validation::validate_transfer_common_compressed;
-use crate::helpers::v1_transfer::invoke_v1_transfer_signed;
+use crate::helpers::v1_transfer::{
+    invoke_v1_transfer_signed, v1_first_output, validate_v1_authority, validate_v1_transfer_payload, V1Leg,
+};
 
-/// Process `transfer_company_to_user` instruction (V1 CPI passthrough).
+/// Validation accounts every layout starts with (`[0..5]`).
+const C2U_BASE_ACCOUNTS: usize = 5;
+/// LEGACY layout: the V1 cToken CPI tail starts right after the base accounts.
+pub const C2U_LEGACY_V1_CPI_ACCOUNTS_START: usize = C2U_BASE_ACCOUNTS;
+/// NEW layout (story 3.40): `[5] fee_payer, [6] system, [7] cToken`, CPI tail from `[8]`
+/// — byte-for-byte the account layout of `transfer_user_to_company`.
+pub const C2U_V1_CPI_ACCOUNTS_START: usize = 8;
+/// LEGACY layout: the V1 TRANSFER starts at this data offset.
+const C2U_LEGACY_V1_OFFSET: usize = 18;
+
+/// Process `transfer_company_to_user` (store → customer reward), V1 CPI passthrough.
 ///
-/// Forwards a pre-built V1 TRANSFER instruction to the mainnet cToken program,
-/// signing with company PDA seeds via `invoke_signed`. The backend builds the
-/// complete V1 Borsh instruction data (`CompressedTokenInstructionDataTransfer`
-/// for compressed→compressed transfer) and the V1-ordered account list; this
-/// instruction only validates security invariants before forwarding.
-///
-/// **MEASURED 2026-09-29 (story 3.21): WORKS on mainnet.** Public tx
+/// **MEASURED 2026-09-29 (story 3.21): WORKS on mainnet** — public tx
 /// `66bFvExdZpcnXirEXS1br2JoxL56Qk1yE7CAuDWvGabZmPSs9tcussJyRvZpvPRS4t7B7wKfqTNUPdak1mBHxYu8`
-/// (slot 451624459) is a successful call; a 1-in-8 sample of the last 1,000
-/// program signatures (2026-09-24→29) had 68 successful calls and 5 errors.
-/// The mainnet cToken still dispatches the Anchor `global:transfer` (V1) instruction — it sits in the binary as an `lddw`
-/// immediate, which is why a contiguous-byte search wrongly concluded it was
-/// gone. The cToken also runs Transfer2 (disc=101, used by `return_to_pool`).
-/// What does NOT work for compressed Z$ is disc=3 (`cpi_compressed_transfer`):
-/// `Custom(18063) InvalidTokenOwner` (story 3.17). The old wording here ("V2
-/// Transfer only works on devnet") was never measured.
+/// (slot 451624459); a 1-in-8 sample of 1,000 signatures had 68 successes and 5 errors.
+/// The mainnet cToken dispatches the Anchor `global:transfer` (V1) instruction
+/// (an `lddw` immediate in the binary). disc=3 (`cpi_compressed_transfer`) does
+/// NOT work for compressed Z$ (`Custom(18063)`, story 3.17).
 ///
-/// ## Security Validations
+/// ## 2026-09-30 (story 3.40) — hardened, two layouts
 ///
-/// 1. `transfer_authority` must be signer (Spec §7.1-§7.8 via `validate_transfer_common_compressed`)
-/// 2. `token_state` must be owned by our program
-/// 3. Company PDA derivation must match `company_id` (prevents signing for wrong PDA)
-/// 4. User PDA derivation must match `user_id` (validates destination)
-/// 5. CPI data must start with V1 TRANSFER disc (prevents other cToken instructions)
-/// 6. CPI target hardcoded to `LIGHT_COMPRESSED_TOKEN_PROGRAM_ID`
+/// Up to `da2b261` this instruction checked only the V1 discriminator and the two
+/// PDAs, then signed ANY payload with the company PDA (review of 3.21, deferred:
+/// a compromised backend had no on-chain brake here). It now runs the same
+/// payload validation as the client-spend instructions
+/// ([`validate_v1_transfer_payload`]): output 0 = the user PDA with the exact
+/// amount, at most one change output back to the company PDA, same mint, no
+/// extra outputs, no compress/decompress (no burn), inputs == outputs
+/// (overflow-checked), and the CPI authority must be the company PDA.
 ///
-/// ## Accounts (minimum 5 + CPI accounts)
-///
-///   0. transfer_authority        (signer)           — must match TRANSFER_AUTHORITY_PUBKEY
-///   1. token_state               (read)             — our program's token_state PDA
-///   2. mint                      (read)             — ZUPY Token-2022 mint
-///   3. company_pda               (read)             — compressed source + CPI signer
-///   4. user_pda                  (read)             — compressed destination (validated)
-///   5+ V1 CPI accounts           (client-assembled) — forwarded to cToken in V1 order
-///
-/// ## Data Layout (after 8-byte Anchor discriminator, stripped by lib.rs)
-///
+/// **NEW layout (backend story 3.41)** — mirror of `transfer_user_to_company`:
 /// ```text
-/// [0..8]   company_id (u64 LE)
-/// [8..16]  user_id (u64 LE)
-/// [16]     company_bump (u8)
-/// [17]     user_bump (u8)
-/// [18..]   raw V1 CPI instruction data (starts with 8-byte V1 TRANSFER disc)
+/// data:     company_id u64 | user_id u64 | amount u64 | company_bump u8 | user_bump u8
+///           | memo String ("zupy:v1:<source>:<id>", REQUIRED) | V1 TRANSFER
+/// accounts: 0 transfer_authority (signer) · 1 token_state · 2 mint · 3 company_pda
+///           · 4 user_pda · 5 fee_payer · 6 system_program · 7 cToken (validated)
+///           · 8+ V1 cToken CPI accounts (authority = company_pda)
 /// ```
+/// The memo is the operation id (e.g. `zupy:v1:ztransaction:<ledger id>`) and
+/// lives in the data of the very instruction that moves the money, so a
+/// payment of a specific ledger row is provable on-chain (story 3.35 found
+/// the company → user carried none).
+///
+/// **LEGACY layout (what the backend sends up to 3.41, still accepted)**:
+/// ```text
+/// data:     company_id u64 | user_id u64 | company_bump u8 | user_bump u8 | V1 TRANSFER
+/// accounts: 0..4 as above · 5+ V1 cToken CPI accounts (authority = company_pda)
+/// ```
+/// Detected by the V1 discriminator at byte 18. The amount is read from output 0
+/// (which must be the user PDA and > 0); everything else is validated as in the
+/// new layout. Unambiguous: in the new layout bytes 18..26 are the 6 high bytes of
+/// `amount` + the two bumps, which would need `amount ≥ 3·2^56` lamports — far
+/// above the whole supply. Dropping the legacy layout is a later upgrade, after
+/// 3.41 is live (story 3.40, Q1 to the PO).
 ///
 /// Discriminator: [8, 143, 213, 13, 143, 247, 145, 33] — UNCHANGED
 pub fn process(
@@ -62,65 +74,98 @@ pub fn process(
     accounts: &[AccountView],
     data: &[u8],
 ) -> ProgramResult {
-    // ── Account extraction (minimum 5 validation accounts) ──────────────
-    if accounts.len() < 5 {
+    if accounts.len() < C2U_BASE_ACCOUNTS {
         return Err(ProgramError::NotEnoughAccountKeys);
     }
-    let transfer_authority  = &accounts[0];
-    let token_state_account = &accounts[1];
-    let mint                = &accounts[2];
-    let company_pda         = &accounts[3]; // source PDA / CPI signer
-    let user_pda            = &accounts[4]; // destination PDA
+    let legacy = data.len() >= C2U_LEGACY_V1_OFFSET + 8
+        && data[C2U_LEGACY_V1_OFFSET..C2U_LEGACY_V1_OFFSET + 8] == TRANSFER_V1_DISC;
+    if legacy {
+        process_legacy(program_id, accounts, data)
+    } else {
+        process_new(program_id, accounts, data)
+    }
+}
 
-    // ── Parse instruction data ──────────────────────────────────────────
-    let company_id_u64 = parse_u64(data, 0)?;
-    let user_id_u64 = parse_u64(data, 8)?;
+/// NEW layout: explicit `amount` + mandatory memo; accounts mirror user → company.
+fn process_new(program_id: &Address, accounts: &[AccountView], data: &[u8]) -> ProgramResult {
+    if accounts.len() < C2U_V1_CPI_ACCOUNTS_START {
+        return Err(ProgramError::NotEnoughAccountKeys);
+    }
+    let company_id = parse_u64(data, 0)?;
+    let user_id = parse_u64(data, 8)?;
+    let amount = parse_u64(data, 16)?;
+    let company_bump = parse_u8(data, 24)?;
+    let user_bump = parse_u8(data, 25)?;
+    let (memo, v1_offset) = parse_string(data, 26)?;
+    let v1_data = &data[v1_offset..];
+
+    if amount == 0 {
+        return Err(ZupyTokenError::ZeroAmount.into());
+    }
+    validate_memo_format(memo)?;
+    validate_transfer_common_compressed(program_id, &accounts[1], &accounts[0], &accounts[2])?;
+    validate_light_ctoken_program(&accounts[7])?;
+
+    let c2u = C2u { company_id, user_id, company_bump, user_bump, amount };
+    c2u.validate_and_forward(program_id, accounts, &accounts[C2U_V1_CPI_ACCOUNTS_START..], v1_data)
+}
+
+/// LEGACY layout: no amount/memo in the header; the amount is output 0 of the payload.
+fn process_legacy(program_id: &Address, accounts: &[AccountView], data: &[u8]) -> ProgramResult {
+    let company_id = parse_u64(data, 0)?;
+    let user_id = parse_u64(data, 8)?;
     let company_bump = parse_u8(data, 16)?;
     let user_bump = parse_u8(data, 17)?;
+    let v1_data = &data[C2U_LEGACY_V1_OFFSET..];
 
-    // Raw V1 CPI instruction data starts at offset 18
-    if data.len() <= 18 {
-        return Err(ProgramError::InvalidInstructionData);
+    let (_, amount) = v1_first_output(v1_data)?;
+    if amount == 0 {
+        return Err(ZupyTokenError::ZeroAmount.into());
     }
-    let v1_cpi_data = &data[18..];
+    validate_transfer_common_compressed(program_id, &accounts[1], &accounts[0], &accounts[2])?;
 
-    // ── Validate V1 TRANSFER discriminator prefix ───────────────────────
-    validate_v1_transfer_disc(v1_cpi_data)?;
+    let c2u = C2u { company_id, user_id, company_bump, user_bump, amount };
+    c2u.validate_and_forward(program_id, accounts, &accounts[C2U_LEGACY_V1_CPI_ACCOUNTS_START..], v1_data)
+}
 
-    // ── Common transfer validation (checks 1–8) ─────────────────────────
-    validate_transfer_common_compressed(
-        program_id,
-        token_state_account,
-        transfer_authority,
-        mint,
-    )?;
+/// Header fields both layouts share once parsed.
+struct C2u {
+    company_id: u64,
+    user_id: u64,
+    company_bump: u8,
+    user_bump: u8,
+    amount: u64,
+}
 
-    // ── PDA validation: company_pda (source) ────────────────────────────
-    let company_id_bytes = company_id_u64.to_le_bytes();
-    validate_pda_with_seeds(
-        company_pda.address(),
-        &[COMPANY_SEED, &company_id_bytes, &[company_bump]],
-        program_id,
-    )?;
+impl C2u {
+    /// PDAs, payload legs, CPI authority — then forward, signed by the company PDA.
+    fn validate_and_forward(
+        &self,
+        program_id: &Address,
+        accounts: &[AccountView],
+        cpi_accounts: &[AccountView],
+        v1_data: &[u8],
+    ) -> ProgramResult {
+        let mint = &accounts[2];
+        let company_pda = &accounts[3]; // source PDA / CPI signer
+        let user_pda = &accounts[4]; // destination PDA
+        validate_id_pda(company_pda.address(), COMPANY_SEED, self.company_id, self.company_bump, program_id)?;
+        validate_id_pda(user_pda.address(), USER_SEED, self.user_id, self.user_bump, program_id)?;
 
-    // ── PDA validation: user_pda (destination) ──────────────────────────
-    let user_id_bytes = user_id_u64.to_le_bytes();
-    validate_pda_with_seeds(
-        user_pda.address(),
-        &[USER_SEED, &user_id_bytes, &[user_bump]],
-        program_id,
-    )?;
+        // Output 0 = exactly `amount` to the user; change (if any) back to the company.
+        let legs = [V1Leg { owner: user_pda.address(), amount: self.amount }];
+        validate_v1_transfer_payload(v1_data, mint.address(), company_pda.address(), &legs)?;
+        validate_v1_authority(cpi_accounts, company_pda)?;
 
-    // ── CPI: Forward V1 TRANSFER to cToken, signing with company PDA ────
-    // company_pda is not a signer on the outer tx; the shared forward forces
-    // its meta to signer and invoke_signed supplies the PDA signature.
-    let bump_bytes = [company_bump];
-    let signer_seeds: [Seed; 3] = [
-        Seed::from(COMPANY_SEED),
-        Seed::from(company_id_bytes.as_ref()),
-        Seed::from(bump_bytes.as_ref()),
-    ];
-    invoke_v1_transfer_signed(&accounts[5..], company_pda, v1_cpi_data, &[Signer::from(&signer_seeds)])
+        let company_id_bytes = self.company_id.to_le_bytes();
+        let bump_bytes = [self.company_bump];
+        let signer_seeds: [Seed; 3] = [
+            Seed::from(COMPANY_SEED),
+            Seed::from(company_id_bytes.as_ref()),
+            Seed::from(bump_bytes.as_ref()),
+        ];
+        invoke_v1_transfer_signed(cpi_accounts, company_pda, v1_data, &[Signer::from(&signer_seeds)])
+    }
 }
 
 #[cfg(test)]

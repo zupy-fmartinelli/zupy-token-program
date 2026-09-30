@@ -8,7 +8,7 @@ use pinocchio::sysvars::rent::Rent;
 
 use pinocchio_associated_token_account::instructions::Create;
 use pinocchio_system::instructions::CreateAccount;
-use pinocchio_token_2022::instructions::{Burn, CloseAccount, InitializeMint2, MintTo, Transfer, TransferChecked};
+use pinocchio_token_2022::instructions::{CloseAccount, InitializeMint2, MintTo, Transfer, TransferChecked};
 
 /// CPI: Token-2022 Transfer (discriminator `0x03`).
 /// Transfers `amount` tokens from `source` to `destination` using PDA signer seeds.
@@ -87,49 +87,6 @@ pub fn cpi_create_ata_if_needed<'a>(
         wallet: owner,
         mint,
         system_program,
-        token_program,
-    }
-    .invoke()?;
-    Ok(())
-}
-
-/// CPI: Token-2022 Burn (discriminator `0x08`).
-/// Burns `amount` tokens from `token_account` using PDA signer seeds (invoke_signed).
-#[inline(always)]
-pub fn cpi_burn<'a>(
-    token_account: &'a AccountView,
-    mint: &'a AccountView,
-    authority: &'a AccountView,
-    amount: u64,
-    token_program: &Address,
-    signers: &[Signer],
-) -> Result<(), ProgramError> {
-    Burn {
-        account: token_account,
-        mint,
-        authority,
-        amount,
-        token_program,
-    }
-    .invoke_signed(signers)?;
-    Ok(())
-}
-
-/// CPI: Token-2022 Burn via regular invoke (no PDA signer).
-/// Used by `burn_tokens` where `token_account_owner` is the signer.
-#[inline(always)]
-pub fn cpi_burn_invoke<'a>(
-    token_account: &'a AccountView,
-    mint: &'a AccountView,
-    authority: &'a AccountView,
-    amount: u64,
-    token_program: &Address,
-) -> Result<(), ProgramError> {
-    Burn {
-        account: token_account,
-        mint,
-        authority,
-        amount,
         token_program,
     }
     .invoke()?;
@@ -490,7 +447,7 @@ pub fn cpi_initialize_metadata_pointer<'a>(
 
 // NOTE: CPI helpers cannot be unit-tested without the Solana runtime.
 // They are integration-tested via Mollusk in tests/test_transfers.rs,
-// tests/test_split_burns.rs, and tests/test_cold_path.rs. The function
+// tests/test_split_burns.rs (split only since story 3.40), and tests/test_cold_path.rs. The function
 // signatures and logic above are verified by compilation and by the
 // Mollusk integration tests that exercise the full instruction flow.
 

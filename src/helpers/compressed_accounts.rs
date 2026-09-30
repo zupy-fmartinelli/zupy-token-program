@@ -18,10 +18,10 @@
 //!   Compressed → compressed on mainnet is the V1 TRANSFER passthrough in
 //!   `helpers::v1_transfer` (story 3.21).
 //!
-//! ## Path C — Compressed Burn
+//! ## Path C — Compressed Burn — REMOVED (story 3.40)
 //!
-//! - [`cpi_compressed_burn`]: Burn from a compressed account.
-//!   Implemented: disc=8, accounts=[authority, mint, fee_payer].
+//! `cpi_compressed_burn` (cToken disc=8) was removed with `burn_tokens` /
+//! `burn_from_company_pda`: Z$ is never burned (PO 2026-09-30, D-51).
 //!
 //! ## Implementation Note: Pinocchio Version Compatibility
 //!
@@ -52,7 +52,7 @@
 //! | Transfer2 (decompress with proof) | disc=101 | **WORKS** — 109 successful `return_to_pool` since 2026-08-22 (story 3.16 Q3) |
 //! | `compress_spl_token_account` | 8-byte Anchor | **WORKS** — 4 successful `transfer_from_pool` in a 1-in-8 sample of the last 1,000 signatures (2026-09-29) |
 //! | cToken-account `Transfer` | disc=3 | **FAILS for compressed Z$** — `Custom(18063) InvalidTokenOwner` (unsigned simulation, story 3.17: `execute_split_transfer` and `transfer_user_to_company`) |
-//! | Burn | disc=8 | NÃO VERIFICADO — no call since the deploy (3.16 Q5); Zupy does not burn (D-51) |
+//! | Burn | disc=8 | not called: the helper was removed in story 3.40 (Zupy never burns, D-51) |
 //!
 //! Dump reproducible read-only: `solana program dump -u m cTokenmWW8bLPjZEBAUgYy3zKxQZW6VKi7bqNFEVv3m ctoken.so`.
 
@@ -761,97 +761,6 @@ pub fn cpi_compressed_transfer<'a>(
     Ok(())
 }
 
-// ── Path C: cpi_compressed_burn ───────────────────────────────────────────────
-
-/// Discriminator for the Light cToken `Burn` instruction.
-///
-/// Value `8` is verified from `light-token-pinocchio 0.22.0` source
-/// (`src/instruction/burn.rs`): `data[0] = 8u8; // Burn discriminator`.
-const BURN_DISC: u8 = 8;
-
-/// Builds the 9-byte Borsh-encoded instruction data for the Light cToken `Burn` instruction.
-///
-/// Layout (mirrors `build_compressed_transfer_data` for Transfer, disc=3):
-/// ```text
-/// [0]    discriminator = 8 (Burn)
-/// [1..9] amount (u64 LE)
-/// ```
-///
-/// The cToken program validates that `authority` owns the compressed token balance,
-/// nullifies the input leaf (destroying the compressed tokens), and decrements
-/// the on-chain mint supply.
-#[inline]
-pub(crate) fn build_compressed_burn_data(amount: u64) -> [u8; 9] {
-    let mut d = [0u8; 9];
-    d[0] = BURN_DISC;
-    d[1..9].copy_from_slice(&amount.to_le_bytes());
-    d
-}
-
-/// CPI: Burn tokens from a compressed account (Path C).
-///
-/// Calls the Light cToken program (`cTokenmWW8bLPjZEBAUgYy3zKxQZW6VKi7bqNFEVv3m`)
-/// with `Burn` instruction (discriminator = 8). The `authority` must sign (typically
-/// the source PDA, signing via `signers` seeds). The `mint` supply is decremented
-/// on-chain.
-///
-/// Account layout matches `light-token-pinocchio 0.22.0` `BurnCpi` (with fee_payer):
-/// `authority` is passed twice — as `source` (writable) and as `authority`
-/// (readonly_signer). The Solana runtime deduplicates same-pubkey accounts,
-/// resulting in writable_signer for the combined entry.
-///
-/// ## Account order passed to the cToken program
-/// ```text
-/// [0] authority   (writable)            — source: compressed token owner/leaf PDA
-/// [1] mint        (writable)            — Token-2022 mint (supply decrement)
-/// [2] authority   (readonly, signer)    — who signs (same pubkey as [0], deduped by runtime)
-/// [3] system_program (readonly)         — Solana System Program
-/// [4] fee_payer   (writable, signer)    — pays Light Protocol rent/fees
-/// [5+] remaining_accounts               — Light system accounts (Merkle tree, nullifier queue, noop)
-/// ```
-#[inline(always)]
-#[allow(clippy::too_many_arguments)]
-pub fn cpi_compressed_burn<'a>(
-    _compressed_token_program: &'a AccountView,
-    payer: &'a AccountView,
-    authority: &'a AccountView,
-    mint: &'a AccountView,
-    system_program: &'a AccountView,
-    amount: u64,
-    remaining_accounts: &'a [AccountView],
-    signers: &[Signer],
-) -> Result<(), ProgramError> {
-    let data = build_compressed_burn_data(amount);
-    let prog_id: Address = LIGHT_COMPRESSED_TOKEN_PROGRAM_ID.into();
-
-    let mut account_metas = Vec::with_capacity(5 + remaining_accounts.len());
-    account_metas.push(InstructionAccount::writable(authority.address()));         // [0] source (= authority, writable)
-    account_metas.push(InstructionAccount::writable(mint.address()));              // [1] mint (writable — supply decrement)
-    account_metas.push(InstructionAccount::readonly_signer(authority.address())); // [2] authority (readonly_signer, deduped w/ [0])
-    account_metas.push(InstructionAccount::readonly(system_program.address()));   // [3] system_program
-    account_metas.push(InstructionAccount::writable_signer(payer.address()));     // [4] fee_payer
-    push_remaining_metas(&mut account_metas, remaining_accounts);
-
-    let instruction = InstructionView {
-        program_id: &prog_id,
-        accounts: &account_metas,
-        data: &data,
-    };
-
-    // Account views must match instruction.accounts 1:1 (no program account).
-    // See cpi_decompress_to_spl for detailed explanation.
-    let mut account_views: Vec<&AccountView> = Vec::with_capacity(5 + remaining_accounts.len());
-    account_views.push(authority);       // [0] source
-    account_views.push(mint);            // [1] mint
-    account_views.push(authority);       // [2] authority (same ref — runtime deduplicates)
-    account_views.push(system_program);  // [3] system_program
-    account_views.push(payer);           // [4] fee_payer
-    account_views.extend(remaining_accounts.iter());
-
-    pinocchio::cpi::invoke_signed_with_slice(&instruction, &account_views, signers)?;
-    Ok(())
-}
-
 // ── SPL Interface PDA Derivation ──────────────────────────────────────────────
 
 /// Derive the Light SPL interface PDA address and bump.
@@ -1091,79 +1000,6 @@ mod tests {
         let a = build_compressed_transfer_data(1_000);
         let b = build_compressed_transfer_data(2_000);
         assert_ne!(a, b, "different amounts must yield different instruction data");
-    }
-
-    // ── build_compressed_burn_data ────────────────────────────────────────
-
-    #[test]
-    fn test_build_compressed_burn_data_discriminator_is_8() {
-        let data = build_compressed_burn_data(1_000_000);
-        assert_eq!(data[0], 8u8, "first byte must be Burn discriminator (8)");
-    }
-
-    #[test]
-    fn test_build_compressed_burn_data_total_length_is_9() {
-        let data = build_compressed_burn_data(0);
-        assert_eq!(data.len(), 9, "instruction data must be exactly 9 bytes");
-    }
-
-    #[test]
-    fn test_build_compressed_burn_data_amount_encoded_correctly() {
-        let amount = 83_333u64; // typical burn portion
-        let data = build_compressed_burn_data(amount);
-        let encoded = u64::from_le_bytes(data[1..9].try_into().unwrap());
-        assert_eq!(encoded, amount, "amount (u64 LE) at bytes [1..9]");
-    }
-
-    #[test]
-    fn test_build_compressed_burn_data_zero_amount() {
-        let data = build_compressed_burn_data(0);
-        assert_eq!(&data[1..9], &[0u8; 8], "amount=0 encodes as 8 zero bytes");
-    }
-
-    #[test]
-    fn test_build_compressed_burn_data_max_amount_u64() {
-        let data = build_compressed_burn_data(u64::MAX);
-        let encoded = u64::from_le_bytes(data[1..9].try_into().unwrap());
-        assert_eq!(encoded, u64::MAX, "handles u64::MAX without truncation");
-    }
-
-    #[test]
-    fn test_build_compressed_burn_data_is_deterministic() {
-        let a = build_compressed_burn_data(42_000);
-        let b = build_compressed_burn_data(42_000);
-        assert_eq!(a, b, "same amount must yield identical instruction data");
-    }
-
-    #[test]
-    fn test_build_compressed_burn_data_different_amounts_differ() {
-        let a = build_compressed_burn_data(1_000);
-        let b = build_compressed_burn_data(2_000);
-        assert_ne!(a, b, "different amounts must yield different instruction data");
-    }
-
-    #[test]
-    fn test_build_compressed_burn_data_discriminator_differs_from_transfer() {
-        let burn_data = build_compressed_burn_data(500);
-        let transfer_data = build_compressed_transfer_data(500);
-        assert_ne!(
-            burn_data[0], transfer_data[0],
-            "Burn (8) and Transfer (3) discriminators must differ"
-        );
-        assert_eq!(burn_data[0], 8, "Burn disc must be 8");
-        assert_eq!(transfer_data[0], 3, "Transfer disc must be 3");
-    }
-
-    #[test]
-    fn test_build_compressed_burn_data_amount_field_matches_transfer_layout() {
-        // Both Burn and Transfer encode amount at bytes [1..9] (u64 LE)
-        let amount = 999_999u64;
-        let burn_data = build_compressed_burn_data(amount);
-        let transfer_data = build_compressed_transfer_data(amount);
-        assert_eq!(
-            &burn_data[1..9], &transfer_data[1..9],
-            "amount field layout must be identical between Burn and Transfer"
-        );
     }
 
     // ── build_decompress_to_spl_data ─────────────────────────────────────────

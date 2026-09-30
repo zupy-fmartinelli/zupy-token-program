@@ -25,6 +25,11 @@ security_txt! {
 
 entrypoint!(process_instruction);
 
+/// `burn_tokens` (#11), removed in story 3.40. Reserved: never reuse.
+pub const RESERVED_BURN_TOKENS: [u8; 8] = [76, 15, 51, 254, 229, 215, 121, 66];
+/// `burn_from_company_pda` (#12), removed in story 3.40. Reserved: never reuse.
+pub const RESERVED_BURN_FROM_COMPANY_PDA: [u8; 8] = [43, 207, 204, 77, 74, 93, 165, 34];
+
 pub fn process_instruction(
     program_id: &Address,
     accounts: &[AccountView],
@@ -80,14 +85,11 @@ pub fn process_instruction(
         [51, 254, 61, 214, 234, 138, 101, 214] => {
             instructions::execute_split_transfer::process(program_id, accounts, data)
         }
-        // 11. burn_tokens
-        [76, 15, 51, 254, 229, 215, 121, 66] => {
-            instructions::burn_tokens::process(program_id, accounts, data)
-        }
-        // 12. burn_from_company_pda
-        [43, 207, 204, 77, 74, 93, 165, 34] => {
-            instructions::burn_from_company_pda::process(program_id, accounts, data)
-        }
+        // 11. burn_tokens / 12. burn_from_company_pda — REMOVED (story 3.40, PO
+        // 2026-09-30: Z$ is never burned). The discriminators stay RESERVED and
+        // must NEVER be reused: an old client or a replayed payload must fail
+        // closed, not hit a different instruction.
+        RESERVED_BURN_TOKENS | RESERVED_BURN_FROM_COMPANY_PDA => Err(ProgramError::InvalidInstructionData),
         // 13. initialize_rate_limit
         [36, 132, 34, 217, 150, 48, 192, 165] => {
             instructions::initialize_rate_limit::process(program_id, accounts, data)
@@ -124,6 +126,10 @@ pub fn process_instruction(
         [170, 95, 61, 209, 55, 75, 105, 211] => {
             instructions::return_to_pool_v1::process(program_id, accounts, data)
         }
+        // 22. consolidate_leaves (story 3.40) — N leaves of one owner → one leaf
+        [131, 243, 51, 130, 117, 203, 4, 156] => {
+            instructions::consolidate_leaves::process(program_id, accounts, data)
+        }
         _ => Err(ProgramError::InvalidInstructionData),
     }
 }
@@ -132,8 +138,8 @@ pub fn process_instruction(
 mod tests {
     use super::*;
 
-    /// All 21 instruction names (must match Anchor exactly).
-    const INSTRUCTION_NAMES: [&str; 21] = [
+    /// The 20 LIVE instructions (names must match Anchor exactly).
+    const INSTRUCTION_NAMES: [&str; 20] = [
         "initialize_token",
         "initialize_metadata",
         "update_metadata_field",
@@ -144,8 +150,6 @@ mod tests {
         "transfer_company_to_user",
         "transfer_user_to_company",
         "execute_split_transfer",
-        "burn_tokens",
-        "burn_from_company_pda",
         "initialize_rate_limit",
         "set_paused",
         "create_zupy_card",
@@ -155,10 +159,11 @@ mod tests {
         "return_user_to_pool",
         "return_user_to_pool_v1",
         "return_to_pool_v1",
+        "consolidate_leaves",
     ];
 
-    /// All 21 discriminators in the same order.
-    const DISCRIMINATORS: [[u8; 8]; 21] = [
+    /// The 20 live discriminators, in the same order.
+    const DISCRIMINATORS: [[u8; 8]; 20] = [
         [38, 209, 150, 50, 190, 117, 16, 54],   // initialize_token
         [35, 215, 241, 156, 122, 208, 206, 212], // initialize_metadata
         [103, 217, 144, 202, 46, 70, 233, 141],  // update_metadata_field
@@ -169,8 +174,6 @@ mod tests {
         [8, 143, 213, 13, 143, 247, 145, 33],    // transfer_company_to_user
         [186, 233, 22, 40, 87, 223, 252, 131],   // transfer_user_to_company
         [51, 254, 61, 214, 234, 138, 101, 214],  // execute_split_transfer
-        [76, 15, 51, 254, 229, 215, 121, 66],    // burn_tokens
-        [43, 207, 204, 77, 74, 93, 165, 34],     // burn_from_company_pda
         [36, 132, 34, 217, 150, 48, 192, 165],   // initialize_rate_limit
         [91, 60, 125, 192, 176, 225, 166, 218],  // set_paused
         [92, 114, 17, 0, 219, 121, 112, 150],    // create_zupy_card
@@ -180,35 +183,38 @@ mod tests {
         [151, 33, 221, 193, 7, 214, 10, 199],    // return_user_to_pool
         [41, 120, 49, 208, 53, 163, 70, 32],     // return_user_to_pool_v1
         [170, 95, 61, 209, 55, 75, 105, 211],    // return_to_pool_v1
+        [131, 243, 51, 130, 117, 203, 4, 156],   // consolidate_leaves
     ];
 
-    /// AC2: Verify each discriminator matches SHA256("global:<name>")[0..8]
-    #[test]
-    fn test_all_21_discriminators_match_sha256() {
-        use sha2::{Sha256, Digest};
+    /// Removed instructions whose discriminators stay reserved (story 3.40).
+    const RESERVED: [(&str, [u8; 8]); 2] = [
+        ("burn_tokens", RESERVED_BURN_TOKENS),
+        ("burn_from_company_pda", RESERVED_BURN_FROM_COMPANY_PDA),
+    ];
 
+    fn sha_disc(name: &str) -> [u8; 8] {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(format!("global:{}", name).as_bytes())[0..8].try_into().unwrap()
+    }
+
+    /// Each discriminator (live and reserved) matches SHA256("global:<name>")[0..8]
+    #[test]
+    fn test_all_discriminators_match_sha256() {
         for (i, name) in INSTRUCTION_NAMES.iter().enumerate() {
-            let input = format!("global:{}", name);
-            let hash = Sha256::digest(input.as_bytes());
-            let expected: [u8; 8] = hash[0..8].try_into().unwrap();
-            assert_eq!(
-                DISCRIMINATORS[i], expected,
-                "Discriminator mismatch for instruction '{}' at index {}",
-                name, i
-            );
+            assert_eq!(DISCRIMINATORS[i], sha_disc(name), "Discriminator mismatch for '{}'", name);
+        }
+        for (name, disc) in RESERVED {
+            assert_eq!(disc, sha_disc(name), "Reserved discriminator mismatch for '{}'", name);
         }
     }
 
-    /// AC2: All 21 discriminators are unique
+    /// Live and reserved discriminators are all distinct (a reserved one is never reused).
     #[test]
     fn test_all_discriminators_unique() {
-        for i in 0..21 {
-            for j in (i + 1)..21 {
-                assert_ne!(
-                    DISCRIMINATORS[i], DISCRIMINATORS[j],
-                    "Duplicate discriminator between '{}' and '{}'",
-                    INSTRUCTION_NAMES[i], INSTRUCTION_NAMES[j]
-                );
+        let all: Vec<[u8; 8]> = DISCRIMINATORS.iter().copied().chain(RESERVED.iter().map(|r| r.1)).collect();
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                assert_ne!(all[i], all[j], "Duplicate discriminator at {} and {}", i, j);
             }
         }
     }
@@ -239,11 +245,10 @@ mod tests {
         assert_eq!(result.unwrap_err(), ProgramError::InvalidInstructionData);
     }
 
-    /// AC3: Valid discriminator dispatches to the correct handler.
-    /// All 21 instructions are implemented and return NotEnoughAccountKeys
-    /// when called with no accounts (proves routing works).
+    /// Every live discriminator dispatches to its handler, which returns
+    /// NotEnoughAccountKeys with no accounts (proves routing works).
     #[test]
-    fn test_valid_discriminator_dispatches_all_21() {
+    fn test_valid_discriminator_dispatches_all_live() {
         let pid = Address::from(constants::PROGRAM_ID);
         for (i, disc) in DISCRIMINATORS.iter().enumerate() {
             let result = process_instruction(&pid, &[], disc);
@@ -253,6 +258,19 @@ mod tests {
                 "Instruction '{}' should return NotEnoughAccountKeys with no accounts",
                 INSTRUCTION_NAMES[i],
             );
+        }
+    }
+
+    /// Story 3.40: the burn discriminators fail closed (no handler, no burn),
+    /// with or without payload.
+    #[test]
+    fn test_reserved_burn_discriminators_fail_closed() {
+        let pid = Address::from(constants::PROGRAM_ID);
+        for (name, disc) in RESERVED {
+            let mut data = Vec::from(disc);
+            assert_eq!(process_instruction(&pid, &[], &data), Err(ProgramError::InvalidInstructionData), "{name}");
+            data.extend_from_slice(&[0u8; 64]);
+            assert_eq!(process_instruction(&pid, &[], &data), Err(ProgramError::InvalidInstructionData), "{name}");
         }
     }
 
@@ -268,10 +286,11 @@ mod tests {
         assert_eq!(result.unwrap_err(), ProgramError::NotEnoughAccountKeys);
     }
 
-    /// AC2: Exactly 21 instructions are handled
+    /// 20 live instructions + 2 reserved (21 before story 3.40, minus 2 burns, plus consolidate_leaves).
     #[test]
-    fn test_exactly_21_instructions() {
-        assert_eq!(INSTRUCTION_NAMES.len(), 21);
-        assert_eq!(DISCRIMINATORS.len(), 21);
+    fn test_exactly_20_live_instructions() {
+        assert_eq!(INSTRUCTION_NAMES.len(), 20);
+        assert_eq!(DISCRIMINATORS.len(), 20);
+        assert_eq!(RESERVED.len(), 2);
     }
 }

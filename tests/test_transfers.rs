@@ -1151,6 +1151,246 @@ mod transfer_company_to_user {
         let result = mollusk.process_instruction(&ix, &accounts);
         assert_ix_not_enough_keys(&result);
     }
+    // ── transfer_company_to_user hardened (story 3.40) ──────────────────
+    //
+    // Two layouts. NEW (the 3.41 contract, mirror of user→company):
+    //   company_id | user_id | amount | company_bump | user_bump | memo | V1,
+    //   accounts [0..4] + fee_payer, system, cToken, V1 CPI tail from [8].
+    // LEGACY (what the backend sends today, still accepted):
+    //   company_id | user_id | company_bump | user_bump | V1 (V1 at byte 18),
+    //   V1 CPI tail from [5]. Both get the full payload validation.
+
+    fn c2u_new_ix(t: &U2c, amount: u64, memo: &str, v1: &[u8], cpi_authority: &Pubkey) -> (Instruction, Vec<(Pubkey, Account)>) {
+        let ctoken_prog = ctoken_program_id();
+        let ts_data = make_transfer_token_state(&t.transfer_auth, &t.mint, &Pubkey::new_unique(), t.bump, true, false);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&2u64.to_le_bytes()); // company_id
+        payload.extend_from_slice(&1u64.to_le_bytes()); // user_id
+        payload.extend_from_slice(&amount.to_le_bytes());
+        payload.push(t.company_bump);
+        payload.push(t.user_bump);
+        payload.extend_from_slice(&build_string(memo));
+        payload.extend_from_slice(v1);
+        let data = build_ix_data(&DISC_TRANSFER_COMPANY_TO_USER, &payload);
+        let mut metas = build_ix_metas(&t.transfer_auth, &t.token_state_pda, &t.mint, &t.company_pda, &t.user_pda, &t.fee_payer, &ctoken_prog);
+        metas.extend(v1_cpi_tail_metas(&t.fee_payer, cpi_authority));
+        let mut accounts = build_accounts(&t.transfer_auth, &t.token_state_pda, ts_data, &t.mint, &t.company_pda, &t.user_pda, &t.fee_payer, &ctoken_prog);
+        if !accounts.iter().any(|(k, _)| k == cpi_authority) {
+            accounts.push((*cpi_authority, make_system_account(0)));
+        }
+        (Instruction::new_with_bytes(program_id(), &data, metas), accounts)
+    }
+
+    fn c2u_legacy_ix(t: &U2c, v1: &[u8], cpi_authority: &Pubkey) -> (Instruction, Vec<(Pubkey, Account)>) {
+        let ctoken_prog = ctoken_program_id();
+        let ts_data = make_transfer_token_state(&t.transfer_auth, &t.mint, &Pubkey::new_unique(), t.bump, true, false);
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&2u64.to_le_bytes()); // company_id
+        payload.extend_from_slice(&1u64.to_le_bytes()); // user_id
+        payload.push(t.company_bump);
+        payload.push(t.user_bump);
+        payload.extend_from_slice(v1);
+        let data = build_ix_data(&DISC_TRANSFER_COMPANY_TO_USER, &payload);
+        let mut metas = build_ix_metas(&t.transfer_auth, &t.token_state_pda, &t.mint, &t.company_pda, &t.user_pda, &t.fee_payer, &ctoken_prog);
+        metas.truncate(5); // legacy: the V1 CPI tail starts at [5]
+        metas.extend(v1_cpi_tail_metas(&t.fee_payer, cpi_authority));
+        metas.push(AccountMeta::new_readonly(ctoken_prog, false)); // tail's self_program: the CPI target
+        let mut accounts = build_accounts(&t.transfer_auth, &t.token_state_pda, ts_data, &t.mint, &t.company_pda, &t.user_pda, &t.fee_payer, &ctoken_prog);
+        if !accounts.iter().any(|(k, _)| k == cpi_authority) {
+            accounts.push((*cpi_authority, make_system_account(0)));
+        }
+        (Instruction::new_with_bytes(program_id(), &data, metas), accounts)
+    }
+
+    /// V1 company → user: outputs `[user = to_user, company change (if > 0)]`.
+    fn c2u_v1(t: &U2c, leaf: u64, to_user: u64, change: u64) -> Vec<u8> {
+        let mut outs = vec![(t.user_pda, to_user, 0u8)];
+        if change > 0 {
+            outs.push((t.company_pda, change, 0));
+        }
+        build_v1_transfer(&t.mint, Some([9u8; 128]), &[V1Input::with_proof(leaf)], &outs)
+    }
+
+    fn c2u(ix_and_accounts: (Instruction, Vec<(Pubkey, Account)>)) -> mollusk_svm::result::InstructionResult {
+        let (ix, accounts) = ix_and_accounts;
+        setup_mollusk().process_instruction(&ix, &accounts)
+    }
+
+    #[test]
+    fn test_c2u_new_layout_reaches_cpi() {
+        let t = u2c_setup();
+        let r = c2u(c2u_new_ix(&t, 1_000_000, "zupy:v1:ztransaction:42", &c2u_v1(&t, 3_000_000, 1_000_000, 2_000_000), &t.company_pda));
+        assert_eq!(r.raw_result, Err(InstructionError::UnsupportedProgramId));
+        println!("transfer_company_to_user (new layout) validation CU={}", r.compute_units_consumed);
+    }
+
+    #[test]
+    fn test_c2u_new_layout_whole_leaf_reaches_cpi() {
+        let t = u2c_setup();
+        let r = c2u(c2u_new_ix(&t, 1_000_000, "zupy:v1:ztransaction:42", &c2u_v1(&t, 1_000_000, 1_000_000, 0), &t.company_pda));
+        assert_eq!(r.raw_result, Err(InstructionError::UnsupportedProgramId));
+    }
+
+    #[test]
+    fn test_c2u_new_layout_amount_disagrees_with_header() {
+        let t = u2c_setup();
+        let r = c2u(c2u_new_ix(&t, 1_000_000, "zupy:v1:ztransaction:42", &c2u_v1(&t, 3_000_000, 1_500_000, 1_500_000), &t.company_pda));
+        assert_ix_custom_err(&r, 6005); // InvalidAmount
+    }
+
+    #[test]
+    fn test_c2u_new_layout_first_output_must_be_the_user() {
+        let t = u2c_setup();
+        let v1 = build_v1_transfer(
+            &t.mint, Some([9u8; 128]), &[V1Input::with_proof(3_000_000)],
+            &[(Pubkey::new_unique(), 1_000_000, 0), (t.company_pda, 2_000_000, 0)],
+        );
+        let r = c2u(c2u_new_ix(&t, 1_000_000, "zupy:v1:ztransaction:42", &v1, &t.company_pda));
+        assert_ix_custom_err(&r, ERR_INVALID_PDA);
+    }
+
+    #[test]
+    fn test_c2u_new_layout_change_to_third_party_rejected() {
+        let t = u2c_setup();
+        let v1 = build_v1_transfer(
+            &t.mint, Some([9u8; 128]), &[V1Input::with_proof(3_000_000)],
+            &[(t.user_pda, 1_000_000, 0), (Pubkey::new_unique(), 2_000_000, 0)],
+        );
+        let r = c2u(c2u_new_ix(&t, 1_000_000, "zupy:v1:ztransaction:42", &v1, &t.company_pda));
+        assert_ix_custom_err(&r, ERR_INVALID_PDA);
+    }
+
+    #[test]
+    fn test_c2u_new_layout_missing_change_would_burn() {
+        let t = u2c_setup();
+        let r = c2u(c2u_new_ix(&t, 1_000_000, "zupy:v1:ztransaction:42", &c2u_v1(&t, 3_000_000, 1_000_000, 0), &t.company_pda));
+        assert_ix_custom_err(&r, 6029); // SplitCalculationError
+    }
+
+    #[test]
+    fn test_c2u_new_layout_insufficient_balance() {
+        let t = u2c_setup();
+        let r = c2u(c2u_new_ix(&t, 1_000_000, "zupy:v1:ztransaction:42", &c2u_v1(&t, 999_999, 1_000_000, 0), &t.company_pda));
+        assert_ix_custom_err(&r, ERR_INSUFFICIENT_BALANCE);
+    }
+
+    #[test]
+    fn test_c2u_new_layout_wrong_mint() {
+        let t = u2c_setup();
+        let v1 = build_v1_transfer(&Pubkey::new_unique(), Some([9u8; 128]), &[V1Input::with_proof(1_000_000)], &[(t.user_pda, 1_000_000, 0)]);
+        let r = c2u(c2u_new_ix(&t, 1_000_000, "zupy:v1:ztransaction:42", &v1, &t.company_pda));
+        assert_ix_custom_err(&r, ERR_INVALID_MINT);
+    }
+
+    #[test]
+    fn test_c2u_new_layout_bad_memo() {
+        let t = u2c_setup();
+        let r = c2u(c2u_new_ix(&t, 1_000_000, "ztransaction-42", &c2u_v1(&t, 1_000_000, 1_000_000, 0), &t.company_pda));
+        assert_ix_custom_err(&r, ERR_INVALID_MEMO_FORMAT);
+    }
+
+    #[test]
+    fn test_c2u_new_layout_cpi_authority_must_be_company_pda() {
+        let t = u2c_setup();
+        let r = c2u(c2u_new_ix(&t, 1_000_000, "zupy:v1:ztransaction:42", &c2u_v1(&t, 1_000_000, 1_000_000, 0), &t.user_pda));
+        assert_ix_custom_err(&r, ERR_INVALID_PDA);
+    }
+
+    #[test]
+    fn test_c2u_new_layout_without_v1_fails_before_cpi() {
+        let t = u2c_setup();
+        let r = c2u(c2u_new_ix(&t, 1_000_000, "zupy:v1:ztransaction:42", &[], &t.company_pda));
+        assert_eq!(r.raw_result, Err(InstructionError::InvalidInstructionData));
+    }
+
+    #[test]
+    fn test_c2u_legacy_layout_reaches_cpi() {
+        let t = u2c_setup();
+        let r = c2u(c2u_legacy_ix(&t, &c2u_v1(&t, 3_000_000, 1_000_000, 2_000_000), &t.company_pda));
+        assert_eq!(r.raw_result, Err(InstructionError::UnsupportedProgramId));
+        println!("transfer_company_to_user (legacy layout) validation CU={}", r.compute_units_consumed);
+    }
+
+    #[test]
+    fn test_c2u_legacy_layout_whole_leaf_reaches_cpi() {
+        let t = u2c_setup();
+        let r = c2u(c2u_legacy_ix(&t, &c2u_v1(&t, 1_000_000, 1_000_000, 0), &t.company_pda));
+        assert_eq!(r.raw_result, Err(InstructionError::UnsupportedProgramId));
+    }
+
+    #[test]
+    fn test_c2u_legacy_layout_destination_must_be_the_user() {
+        let t = u2c_setup();
+        let v1 = build_v1_transfer(
+            &t.mint, Some([9u8; 128]), &[V1Input::with_proof(3_000_000)],
+            &[(Pubkey::new_unique(), 1_000_000, 0), (t.company_pda, 2_000_000, 0)],
+        );
+        let r = c2u(c2u_legacy_ix(&t, &v1, &t.company_pda));
+        assert_ix_custom_err(&r, ERR_INVALID_PDA);
+    }
+
+    #[test]
+    fn test_c2u_legacy_layout_change_to_third_party_rejected() {
+        let t = u2c_setup();
+        let v1 = build_v1_transfer(
+            &t.mint, Some([9u8; 128]), &[V1Input::with_proof(3_000_000)],
+            &[(t.user_pda, 1_000_000, 0), (Pubkey::new_unique(), 2_000_000, 0)],
+        );
+        let r = c2u(c2u_legacy_ix(&t, &v1, &t.company_pda));
+        assert_ix_custom_err(&r, ERR_INVALID_PDA);
+    }
+
+    #[test]
+    fn test_c2u_legacy_layout_second_output_to_the_user_rejected() {
+        // Change must go back to the company; a 2nd output to the user is an extra leg.
+        let t = u2c_setup();
+        let v1 = build_v1_transfer(
+            &t.mint, Some([9u8; 128]), &[V1Input::with_proof(3_000_000)],
+            &[(t.user_pda, 1_000_000, 0), (t.user_pda, 2_000_000, 0)],
+        );
+        let r = c2u(c2u_legacy_ix(&t, &v1, &t.company_pda));
+        assert_ix_custom_err(&r, ERR_INVALID_PDA);
+    }
+
+    #[test]
+    fn test_c2u_legacy_layout_zero_amount_rejected() {
+        let t = u2c_setup();
+        let r = c2u(c2u_legacy_ix(&t, &c2u_v1(&t, 1_000_000, 0, 1_000_000), &t.company_pda));
+        assert_ix_custom_err(&r, ERR_ZERO_AMOUNT);
+    }
+
+    #[test]
+    fn test_c2u_legacy_layout_missing_change_would_burn() {
+        let t = u2c_setup();
+        let r = c2u(c2u_legacy_ix(&t, &c2u_v1(&t, 3_000_000, 1_000_000, 0), &t.company_pda));
+        assert_ix_custom_err(&r, 6029);
+    }
+
+    #[test]
+    fn test_c2u_legacy_layout_wrong_mint() {
+        let t = u2c_setup();
+        let v1 = build_v1_transfer(&Pubkey::new_unique(), Some([9u8; 128]), &[V1Input::with_proof(1_000_000)], &[(t.user_pda, 1_000_000, 0)]);
+        let r = c2u(c2u_legacy_ix(&t, &v1, &t.company_pda));
+        assert_ix_custom_err(&r, ERR_INVALID_MINT);
+    }
+
+    #[test]
+    fn test_c2u_legacy_layout_cpi_authority_must_be_company_pda() {
+        let t = u2c_setup();
+        let r = c2u(c2u_legacy_ix(&t, &c2u_v1(&t, 1_000_000, 1_000_000, 0), &t.user_pda));
+        assert_ix_custom_err(&r, ERR_INVALID_PDA);
+    }
+
+    #[test]
+    fn test_c2u_legacy_layout_wrong_user_pda() {
+        let t = u2c_setup();
+        let (mut ix, mut accounts) = c2u_legacy_ix(&t, &c2u_v1(&t, 1_000_000, 1_000_000, 0), &t.company_pda);
+        let impostor = Pubkey::new_unique();
+        ix.accounts[4].pubkey = impostor;
+        accounts.push((impostor, make_program_account(vec![], 1_000_000)));
+        let r = setup_mollusk().process_instruction(&ix, &accounts);
+        assert_ix_custom_err(&r, ERR_INVALID_PDA);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

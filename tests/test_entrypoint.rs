@@ -8,8 +8,9 @@ mod helpers;
 use helpers::*;
 use solana_instruction::Instruction;
 
-/// All 17 instruction discriminators.
-const DISCRIMINATORS: [([u8; 8], &str); 17] = [
+/// Instruction discriminators exercised here (burns removed in story 3.40 —
+/// see `test_reserved_burn_discriminators_fail_closed`; consolidate_leaves added).
+const DISCRIMINATORS: [([u8; 8], &str); 16] = [
     ([38, 209, 150, 50, 190, 117, 16, 54], "initialize_token"),
     ([35, 215, 241, 156, 122, 208, 206, 212], "initialize_metadata"),
     ([103, 217, 144, 202, 46, 70, 233, 141], "update_metadata_field"),
@@ -20,13 +21,19 @@ const DISCRIMINATORS: [([u8; 8], &str); 17] = [
     ([8, 143, 213, 13, 143, 247, 145, 33], "transfer_company_to_user"),
     ([186, 233, 22, 40, 87, 223, 252, 131], "transfer_user_to_company"),
     ([51, 254, 61, 214, 234, 138, 101, 214], "execute_split_transfer"),
-    ([76, 15, 51, 254, 229, 215, 121, 66], "burn_tokens"),
-    ([43, 207, 204, 77, 74, 93, 165, 34], "burn_from_company_pda"),
     ([36, 132, 34, 217, 150, 48, 192, 165], "initialize_rate_limit"),
     ([91, 60, 125, 192, 176, 225, 166, 218], "set_paused"),
     ([92, 114, 17, 0, 219, 121, 112, 150], "create_zupy_card"),
     ([5, 106, 153, 76, 114, 157, 63, 236], "create_coupon_nft"),
     ([75, 5, 206, 155, 96, 133, 98, 15], "mint_coupon_cnft"),
+    ([131, 243, 51, 130, 117, 203, 4, 156], "consolidate_leaves"),
+];
+
+/// Story 3.40: the removed burn instructions keep their discriminators
+/// RESERVED — they fail closed with InvalidInstructionData, never burn.
+const RESERVED_BURNS: [([u8; 8], &str); 2] = [
+    ([76, 15, 51, 254, 229, 215, 121, 66], "burn_tokens"),
+    ([43, 207, 204, 77, 74, 93, 165, 34], "burn_from_company_pda"),
 ];
 
 /// Mollusk instance loads the built program successfully.
@@ -36,7 +43,7 @@ fn test_mollusk_setup() {
 }
 
 /// Each instruction dispatches and executes with CU reported.
-/// All 17 handlers are invoked with no accounts. Most return Err
+/// Every listed handler is invoked with no accounts. Most return Err
 /// (NotEnoughAccountKeys or InvalidInstructionData), but some cold-path
 /// handlers may return Ok with minimal CU due to SBF/Pinocchio edge cases.
 /// The key assertion is: dispatch works (CU > 0) and no panics.
@@ -94,10 +101,10 @@ fn test_cu_baseline_entrypoint_dispatch() {
     let mollusk = setup_mollusk();
     let pid = program_id();
 
-    // Use set_paused (index 13) as the baseline — simplest implemented handler
+    // Use set_paused as the baseline — simplest implemented handler
     let instruction = Instruction::new_with_bytes(
         pid,
-        &DISCRIMINATORS[13].0,
+        &DISCRIMINATORS[11].0,
         vec![],
     );
     let result = mollusk.process_instruction(&instruction, &[]);
@@ -114,4 +121,21 @@ fn test_cu_baseline_entrypoint_dispatch() {
         "Dispatch baseline should use < 5000 CU, got {}",
         result.compute_units_consumed
     );
+}
+
+/// Story 3.40: burn_tokens / burn_from_company_pda are gone from the binary;
+/// their discriminators return InvalidInstructionData (with or without data).
+#[test]
+fn test_reserved_burn_discriminators_fail_closed_via_mollusk() {
+    use solana_instruction::error::InstructionError;
+    let mollusk = setup_mollusk();
+    let pid = program_id();
+    for (disc, name) in &RESERVED_BURNS {
+        let mut data = disc.to_vec();
+        let r = mollusk.process_instruction(&Instruction::new_with_bytes(pid, &data, vec![]), &[]);
+        assert_eq!(r.raw_result, Err(InstructionError::InvalidInstructionData), "{name}");
+        data.extend_from_slice(&[0u8; 64]);
+        let r = mollusk.process_instruction(&Instruction::new_with_bytes(pid, &data, vec![]), &[]);
+        assert_eq!(r.raw_result, Err(InstructionError::InvalidInstructionData), "{name}");
+    }
 }

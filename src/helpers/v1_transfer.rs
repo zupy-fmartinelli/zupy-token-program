@@ -25,12 +25,14 @@
 //!
 //! ## Why the program parses the payload
 //!
-//! `transfer_company_to_user` forwards the backend-built payload without reading
-//! it (the transfer authority is trusted). For the CLIENT spend paths the
-//! program signs with the user's PDA, so it checks that the payload moves
-//! exactly the legs declared in the instruction header and nothing else:
-//! [`validate_v1_transfer_payload`]. The program still decides no amount — it
-//! only refuses a payload that disagrees with the legs it was handed.
+//! Every instruction that signs a V1 TRANSFER with one of our PDAs checks that
+//! the payload moves exactly the legs declared in the instruction header and
+//! nothing else: [`validate_v1_transfer_payload`] for the client spends (3.21)
+//! and, since story 3.40, for `transfer_company_to_user` too (it used to
+//! forward the backend-built payload unread); [`validate_v1_consolidation_payload`]
+//! for `consolidate_leaves` (N leaves of one owner → one leaf, same owner). The
+//! program still decides no amount — it only refuses a payload that disagrees
+//! with the legs it was handed.
 
 use pinocchio::cpi::Signer;
 use pinocchio::error::ProgramError;
@@ -43,8 +45,12 @@ use crate::helpers::compressed_accounts::{build_metas_forcing_signer, validate_v
 use crate::helpers::instruction_data::{parse_u32, parse_u64, parse_u8};
 
 /// Upper bound on input leaves in one V1 transfer (bounds the parse loop).
-/// The backend sends one; Light's own client never batches more than 8.
+/// Light's own client never batches more than 8 (proof batch sizes 1, 2, 3, 4, 8);
+/// 8 leaves + proof fit in 857 B with the Light ALT (story 3.40, measured).
 pub const MAX_V1_INPUTS: u32 = 8;
+
+/// Fewest leaves a consolidation merges (one leaf is already consolidated).
+pub const MIN_CONSOLIDATION_INPUTS: u32 = 2;
 
 /// Size of a Groth16 `CompressedProof` (a:32 + b:64 + c:32).
 const COMPRESSED_PROOF_LEN: usize = 128;
@@ -129,6 +135,21 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// Shape rules that differ between a spend and a consolidation.
+#[derive(Clone, Copy)]
+struct V1Shape {
+    /// Fewest input leaves accepted (a consolidation of one leaf is a no-op).
+    min_inputs: u32,
+    /// Whether one change output back to the source owner may follow the legs.
+    allow_change: bool,
+}
+
+/// Spend (story 3.21): 1..=8 inputs, legs + at most one change to the source.
+const SPEND: V1Shape = V1Shape { min_inputs: 1, allow_change: true };
+
+/// Consolidation (story 3.40): 2..=8 inputs, exactly ONE output, no change.
+const CONSOLIDATION: V1Shape = V1Shape { min_inputs: MIN_CONSOLIDATION_INPUTS, allow_change: false };
+
 /// Validate a V1 TRANSFER payload (`disc(8) | u32 len | Borsh`) before the
 /// program signs it with `source_owner`'s PDA seeds.
 ///
@@ -138,31 +159,70 @@ impl<'a> Reader<'a> {
 /// compress/decompress, no CPI context, no lamports change, and an optional
 /// trailing `with_transaction_hash` bool. Sum of inputs must equal sum of
 /// outputs (overflow-checked) — money is conserved, never burned or minted.
+/// `legs` must not be empty (review 3.21, deferred: the function refuses it
+/// itself instead of trusting every caller).
 pub fn validate_v1_transfer_payload(
     v1_data: &[u8],
     mint: &Address,
     source_owner: &Address,
     legs: &[V1Leg],
 ) -> Result<(), ProgramError> {
+    validate_v1_payload(v1_data, mint, source_owner, legs, SPEND)
+}
+
+/// Validate a CONSOLIDATION payload (story 3.40): 2..=8 input leaves, all
+/// spent by `owner` (the CPI authority, checked by the caller), and exactly one
+/// output — to `owner`, of exactly `amount` — where `amount` equals the sum of
+/// the inputs (overflow-checked). No fee leg, no change, no burn.
+pub fn validate_v1_consolidation_payload(
+    v1_data: &[u8],
+    mint: &Address,
+    owner: &Address,
+    amount: u64,
+) -> Result<(), ProgramError> {
+    validate_v1_payload(v1_data, mint, owner, &[V1Leg { owner, amount }], CONSOLIDATION)
+}
+
+/// Open the `disc(8) | u32 len | Borsh` envelope and position a reader at the
+/// start of the inner `CompressedTokenInstructionDataTransfer`.
+fn open_v1(v1_data: &[u8]) -> Result<Reader<'_>, ProgramError> {
     validate_v1_transfer_disc(v1_data)?;
     let inner_len = parse_u32(v1_data, 8)? as usize;
     let inner = &v1_data[12..];
     if inner.len() != inner_len {
         return Err(ProgramError::InvalidInstructionData);
     }
-    let mut r = Reader { data: inner, offset: 0 };
+    Ok(Reader { data: inner, offset: 0 })
+}
 
+/// Read the header up to the inputs: proof (skipped), mint, delegated_transfer.
+fn read_header<'a>(r: &mut Reader<'a>) -> Result<&'a [u8], ProgramError> {
     // proof: Option<CompressedProof> — None is valid for prove-by-index inputs.
     if r.option_tag()? {
         r.skip(COMPRESSED_PROOF_LEN)?;
     }
-    if r.pubkey()? != mint.as_ref() {
+    let mint = r.pubkey()?;
+    r.require_none()?; // delegated_transfer
+    Ok(mint)
+}
+
+fn validate_v1_payload(
+    v1_data: &[u8],
+    mint: &Address,
+    source_owner: &Address,
+    legs: &[V1Leg],
+    shape: V1Shape,
+) -> Result<(), ProgramError> {
+    if legs.is_empty() {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let mut r = open_v1(v1_data)?;
+    if read_header(&mut r)? != mint.as_ref() {
         return Err(ZupyTokenError::InvalidMint.into());
     }
-    r.require_none()?; // delegated_transfer
 
-    let inputs_total = read_inputs(&mut r)?;
-    let outputs_total = read_outputs(&mut r, source_owner, legs)?;
+    let inputs_total = read_inputs(&mut r, shape.min_inputs)?;
+    let outputs_total = read_outputs(&mut r, source_owner, legs, shape.allow_change)?;
 
     if r.u8()? != 0 {
         return Err(ProgramError::InvalidInstructionData); // is_compress must be false
@@ -187,10 +247,26 @@ pub fn validate_v1_transfer_payload(
     Ok(())
 }
 
+/// Owner and amount of output 0 of a V1 payload — what the backend's current
+/// `transfer_company_to_user` payload moves to the user (it declares no amount
+/// in the header). Only reads; the caller still runs the full validation with
+/// this amount as the leg, so a malformed tail is refused there.
+pub fn v1_first_output(v1_data: &[u8]) -> Result<(&[u8], u64), ProgramError> {
+    let mut r = open_v1(v1_data)?;
+    read_header(&mut r)?;
+    read_inputs(&mut r, 1)?;
+    if r.u32()? == 0 {
+        return Err(ProgramError::InvalidInstructionData);
+    }
+    let owner = r.pubkey()?;
+    let amount = r.u64()?;
+    Ok((owner, amount))
+}
+
 /// Read `input_token_data_with_context`, returning the overflow-checked sum.
-fn read_inputs(r: &mut Reader) -> Result<u64, ProgramError> {
+fn read_inputs(r: &mut Reader, min_inputs: u32) -> Result<u64, ProgramError> {
     let count = r.u32()?;
-    if count == 0 || count > MAX_V1_INPUTS {
+    if count < min_inputs || count > MAX_V1_INPUTS {
         return Err(ProgramError::InvalidInstructionData);
     }
     let mut total: u64 = 0;
@@ -205,11 +281,18 @@ fn read_inputs(r: &mut Reader) -> Result<u64, ProgramError> {
     Ok(total)
 }
 
-/// Read `output_compressed_accounts`: `legs` in order, then at most one change
-/// output back to `source_owner`. Returns the overflow-checked sum.
-fn read_outputs(r: &mut Reader, source_owner: &Address, legs: &[V1Leg]) -> Result<u64, ProgramError> {
+/// Read `output_compressed_accounts`: `legs` in order, then (if `allow_change`)
+/// at most one change output back to `source_owner`. Returns the
+/// overflow-checked sum.
+fn read_outputs(
+    r: &mut Reader,
+    source_owner: &Address,
+    legs: &[V1Leg],
+    allow_change: bool,
+) -> Result<u64, ProgramError> {
     let count = r.u32()? as usize;
-    if count != legs.len() && count != legs.len() + 1 {
+    let with_change = allow_change && count == legs.len() + 1;
+    if count != legs.len() && !with_change {
         return Err(ProgramError::InvalidInstructionData);
     }
     let mut total: u64 = 0;
@@ -762,6 +845,144 @@ mod tests {
         let mut p = payload(vec![input(840)], vec![output(COMPANY, 800), output(POOL, 40)]);
         p.tail = vec![2];
         assert_eq!(check(&p, 800, 40), Err(ProgramError::InvalidInstructionData));
+    }
+
+    // ── Consolidation (story 3.40): N leaves of ONE owner → ONE leaf ────────
+
+    fn consolidate(p: &Payload, declared: u64) -> Result<(), ProgramError> {
+        let (mint, user) = (addr(MINT), addr(USER));
+        validate_v1_consolidation_payload(&encode(p), &mint, &user, declared)
+    }
+
+    #[test]
+    fn consolidation_of_two_leaves_is_valid() {
+        let p = payload(vec![input(300), input(700)], vec![output(USER, 1_000)]);
+        assert_eq!(consolidate(&p, 1_000), Ok(()));
+    }
+
+    #[test]
+    fn consolidation_of_eight_leaves_is_valid() {
+        let p = payload((1..=8).map(input).collect(), vec![output(USER, 36)]);
+        assert_eq!(consolidate(&p, 36), Ok(()));
+    }
+
+    #[test]
+    fn consolidation_of_a_single_leaf_is_rejected() {
+        let p = payload(vec![input(1_000)], vec![output(USER, 1_000)]);
+        assert_eq!(consolidate(&p, 1_000), Err(ProgramError::InvalidInstructionData));
+    }
+
+    #[test]
+    fn consolidation_of_nine_leaves_is_rejected() {
+        let p = payload((1..=9).map(input).collect(), vec![output(USER, 45)]);
+        assert_eq!(consolidate(&p, 45), Err(ProgramError::InvalidInstructionData));
+    }
+
+    #[test]
+    fn consolidation_with_two_outputs_is_rejected_even_to_the_owner() {
+        let p = payload(vec![input(500), input(500)], vec![output(USER, 600), output(USER, 400)]);
+        assert_eq!(consolidate(&p, 600), Err(ProgramError::InvalidInstructionData));
+    }
+
+    #[test]
+    fn consolidation_without_output_is_rejected() {
+        let p = payload(vec![input(500), input(500)], vec![]);
+        assert_eq!(consolidate(&p, 1_000), Err(ProgramError::InvalidInstructionData));
+    }
+
+    #[test]
+    fn consolidation_to_another_owner_is_rejected() {
+        let p = payload(vec![input(500), input(500)], vec![output(COMPANY, 1_000)]);
+        assert_eq!(consolidate(&p, 1_000), custom(ZupyTokenError::InvalidPDA));
+    }
+
+    #[test]
+    fn consolidation_output_other_than_declared_is_rejected() {
+        let p = payload(vec![input(500), input(500)], vec![output(USER, 1_000)]);
+        assert_eq!(consolidate(&p, 999), custom(ZupyTokenError::InvalidAmount));
+    }
+
+    #[test]
+    fn consolidation_with_inputs_short_of_declared_is_insufficient_balance() {
+        let p = payload(vec![input(500), input(400)], vec![output(USER, 1_000)]);
+        assert_eq!(consolidate(&p, 1_000), custom(ZupyTokenError::InsufficientBalance));
+    }
+
+    #[test]
+    fn consolidation_that_would_burn_the_excess_is_rejected() {
+        let p = payload(vec![input(600), input(500)], vec![output(USER, 1_000)]);
+        assert_eq!(consolidate(&p, 1_000), custom(ZupyTokenError::SplitCalculationError));
+    }
+
+    #[test]
+    fn consolidation_with_wrong_mint_is_rejected() {
+        let mut p = payload(vec![input(500), input(500)], vec![output(USER, 1_000)]);
+        p.mint = [8u8; 32];
+        assert_eq!(consolidate(&p, 1_000), custom(ZupyTokenError::InvalidMint));
+    }
+
+    #[test]
+    fn consolidation_input_overflow_is_rejected() {
+        let p = payload(vec![input(u64::MAX), input(1)], vec![output(USER, 1)]);
+        assert_eq!(consolidate(&p, 1), custom(ZupyTokenError::SplitCalculationError));
+    }
+
+    #[test]
+    fn consolidation_with_decompress_is_rejected() {
+        let mut p = payload(vec![input(500), input(500)], vec![output(USER, 1_000)]);
+        p.compress_amount = Some(1);
+        assert_eq!(consolidate(&p, 1_000), Err(ProgramError::InvalidInstructionData));
+    }
+
+    #[test]
+    fn consolidation_input_with_delegate_is_rejected() {
+        let mut i = input(500);
+        i.delegate = Some(0);
+        let p = payload(vec![i, input(500)], vec![output(USER, 1_000)]);
+        assert_eq!(consolidate(&p, 1_000), Err(ProgramError::InvalidInstructionData));
+    }
+
+    // ── Shared guard (review 3.21, deferred): no legs = nothing to execute ──
+
+    #[test]
+    fn empty_legs_are_rejected() {
+        let p = payload(vec![input(1_000)], vec![output(USER, 1_000)]);
+        let (mint, user) = (addr(MINT), addr(USER));
+        assert_eq!(
+            validate_v1_transfer_payload(&encode(&p), &mint, &user, &[]),
+            Err(ProgramError::InvalidInstructionData)
+        );
+    }
+
+    // ── First output (legacy transfer_company_to_user layout, story 3.40) ──
+
+    #[test]
+    fn first_output_is_read_from_the_payload() {
+        let p = payload(vec![input(1_000), input(5)], vec![output(COMPANY, 800), output(USER, 205)]);
+        let data = encode(&p);
+        let (owner, amount) = v1_first_output(&data).unwrap();
+        assert_eq!((owner, amount), (&COMPANY[..], 800));
+    }
+
+    #[test]
+    fn first_output_of_a_payload_without_outputs_is_rejected() {
+        let p = payload(vec![input(1_000)], vec![]);
+        assert_eq!(v1_first_output(&encode(&p)), Err(ProgramError::InvalidInstructionData));
+    }
+
+    #[test]
+    fn first_output_of_a_truncated_payload_is_rejected() {
+        let p = payload(vec![input(1_000)], vec![output(COMPANY, 800)]);
+        let data = encode(&p);
+        assert_eq!(v1_first_output(&data[..60]), Err(ProgramError::InvalidInstructionData));
+    }
+
+    #[test]
+    fn first_output_requires_the_v1_discriminator() {
+        let p = payload(vec![input(1_000)], vec![output(COMPANY, 800)]);
+        let mut data = encode(&p);
+        data[0] ^= 0xff;
+        assert_eq!(v1_first_output(&data), Err(ProgramError::InvalidInstructionData));
     }
 
     // ── Real mainnet payload ────────────────────────────────────────────────

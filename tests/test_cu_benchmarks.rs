@@ -55,8 +55,6 @@ const MAX_CU_TRANSFER_C2U: u64 = 11_000;
 const MAX_CU_TRANSFER_U2C: u64 = 14_000;
 const MAX_CU_SPLIT_TRANSFER: u64 = 15_000;
 const MAX_CU_RETURN_TO_POOL: u64 = 20_000; // binary grew with return_user_to_pool instruction ~18626 observed
-const MAX_CU_BURN_TOKENS: u64 = 5_000;
-const MAX_CU_BURN_FROM_COMPANY: u64 = 8_000;
 const MAX_CU_MINT_TOKENS: u64 = 5_000;
 const MAX_CU_INITIALIZE_TOKEN: u64 = 20_000;
 const MAX_CU_INITIALIZE_METADATA: u64 = 15_000;
@@ -250,7 +248,6 @@ fn setup_transfer_c2u() -> (Instruction, Vec<(Pubkey, Account)>) {
     let (user_pda, user_bump) = derive_user_pda(user_id);
     let fee_payer = Pubkey::new_unique();
     let ctoken_prog = Pubkey::new_from_array(LIGHT_COMPRESSED_TOKEN_PROGRAM_ID);
-    let ctoken_auth = derive_ctoken_authority();
 
     let ts_data = make_transfer_token_state(&transfer_auth, &mint, &pool_ata, bump, true, false);
 
@@ -263,13 +260,19 @@ fn setup_transfer_c2u() -> (Instruction, Vec<(Pubkey, Account)>) {
     payload.push(company_bump);
     payload.push(user_bump);
     payload.extend_from_slice(&memo);
+    // Story 3.40 (GR23): the new layout carries the V1 TRANSFER after the memo;
+    // without it the fixture stopped at InvalidInstructionData and measured
+    // nothing. Now it runs every check and reaches the cToken CPI.
+    payload.extend_from_slice(&build_v1_transfer(
+        &mint, Some([9u8; 128]), &[V1Input::with_proof(3_000_000)],
+        &[(user_pda, amount, 0), (company_pda, 2_000_000, 0)],
+    ));
     let data = build_ix_data(&DISC_TRANSFER_COMPANY_TO_USER, &payload);
 
-    // 9-account compressed layout (Path B: compressed → compressed)
-    // [0] transfer_authority [1] token_state [2] mint [3] company_pda (src)
-    // [4] user_pda (dst) [5] fee_payer [6] system_program
-    // [7] compressed_token_program [8] compressed_token_authority
-    let metas = vec![
+    // NEW layout (story 3.40): [0] transfer_authority [1] token_state [2] mint
+    // [3] company_pda (src) [4] user_pda (dst) [5] fee_payer [6] system_program
+    // [7] compressed_token_program, then the V1 CPI tail (authority = company_pda)
+    let mut metas = vec![
         AccountMeta::new(transfer_auth, true),
         AccountMeta::new_readonly(token_state_pda, false),
         AccountMeta::new_readonly(mint, false),
@@ -278,8 +281,8 @@ fn setup_transfer_c2u() -> (Instruction, Vec<(Pubkey, Account)>) {
         AccountMeta::new(fee_payer, true),
         AccountMeta::new_readonly(system_program_id(), false),
         AccountMeta::new_readonly(ctoken_prog, false),
-        AccountMeta::new_readonly(ctoken_auth, false),
     ];
+    metas.extend(v1_cpi_tail_metas(&fee_payer, &company_pda));
 
     let accounts = vec![
         (transfer_auth, make_system_account(10_000_000)),
@@ -290,7 +293,6 @@ fn setup_transfer_c2u() -> (Instruction, Vec<(Pubkey, Account)>) {
         (fee_payer, make_system_account(10_000_000)),
         make_program_stub(&system_program_id()),
         make_program_stub(&ctoken_prog),
-        (ctoken_auth, make_system_account(1_000_000)),
     ];
 
     (Instruction::new_with_bytes(program_id(), &data, metas), accounts)
@@ -302,6 +304,8 @@ fn test_cu_transfer_company_to_user_happy_path() {
     let (ix, accounts) = setup_transfer_c2u();
     let result = run_benchmark(&mollusk, &ix, &accounts);
     println!("transfer_company_to_user    happy-path CU: {}", result.compute_units_consumed);
+    // Story 3.40: every check passed and the cToken CPI was attempted.
+    assert_eq!(result.raw_result, Err(solana_instruction::error::InstructionError::UnsupportedProgramId));
     assert!(
         result.compute_units_consumed <= MAX_CU_TRANSFER_C2U,
         "transfer_company_to_user CU {} > max {}",
@@ -538,119 +542,7 @@ fn test_cu_return_to_pool_happy_path() {
     );
 }
 
-// ── 6. burn_tokens ───────────────────────────────────────────────────────
-
-fn setup_burn_tokens() -> (Instruction, Vec<(Pubkey, Account)>) {
-    let (token_state_pda, bump) = derive_token_state_pda();
-    let treasury = treasury_wallet();
-    let mint = Pubkey::new_unique();
-    let pool_ata = Pubkey::new_unique();
-    let treasury_ata = Pubkey::new_unique();
-
-    let dummy = Pubkey::new_unique();
-    let ts_data = make_token_state_data(
-        &treasury, &dummy, &dummy, &pool_ata, &dummy, &dummy, &treasury_ata,
-        &mint, bump, true, false,
-    );
-
-    let amount: u64 = 500_000;
-    let memo = build_string("zupy:v1:burn:manual");
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&amount.to_le_bytes());
-    payload.extend_from_slice(&memo);
-    let data = build_ix_data(&DISC_BURN_TOKENS, &payload);
-
-    let metas = vec![
-        AccountMeta::new(treasury, true),
-        AccountMeta::new_readonly(token_state_pda, false),
-        AccountMeta::new(mint, false),
-        AccountMeta::new(treasury_ata, false),
-        AccountMeta::new(treasury, true), // token_account_owner (same as authority)
-        AccountMeta::new_readonly(token_2022_id(), false),
-    ];
-
-    let accounts = vec![
-        (treasury, make_system_account(1_000_000)),
-        (token_state_pda, make_program_account(ts_data, 1_000_000)),
-        (mint, make_token_owned_account(make_mint_data(&token_state_pda, 1_000_000_000, 6))),
-        (treasury_ata, make_token_owned_account(make_token_account_data(&mint, &treasury, 10_000_000))),
-        (treasury, make_system_account(1_000_000)),
-        make_program_stub(&token_2022_id()),
-    ];
-
-    (Instruction::new_with_bytes(program_id(), &data, metas), accounts)
-}
-
-#[test]
-fn test_cu_burn_tokens_happy_path() {
-    let mollusk = setup_mollusk();
-    let (ix, accounts) = setup_burn_tokens();
-    let result = run_benchmark(&mollusk, &ix, &accounts);
-    println!("burn_tokens                 happy-path CU: {}", result.compute_units_consumed);
-    assert!(
-        result.compute_units_consumed <= MAX_CU_BURN_TOKENS,
-        "burn_tokens CU {} > max {}",
-        result.compute_units_consumed, MAX_CU_BURN_TOKENS,
-    );
-}
-
-// ── 7. burn_from_company_pda ─────────────────────────────────────────────
-
-fn setup_burn_from_company_pda() -> (Instruction, Vec<(Pubkey, Account)>) {
-    let (token_state_pda, bump) = derive_token_state_pda();
-    let transfer_auth = Pubkey::new_unique();
-    let mint = Pubkey::new_unique();
-    let pool_ata = Pubkey::new_unique();
-    let company_id: u64 = 42;
-    let (company_pda, _) = derive_company_pda(company_id);
-    let fee_payer = Pubkey::new_unique();
-    let ctoken_prog = Pubkey::new_from_array(LIGHT_COMPRESSED_TOKEN_PROGRAM_ID);
-
-    let ts_data = make_transfer_token_state(&transfer_auth, &mint, &pool_ata, bump, true, false);
-
-    let amount: u64 = 500_000;
-    let memo = build_string("zupy:v1:burn_company:42");
-    let mut payload = Vec::new();
-    payload.extend_from_slice(&company_id.to_le_bytes());
-    payload.extend_from_slice(&amount.to_le_bytes());
-    payload.extend_from_slice(&memo);
-    let data = build_ix_data(&DISC_BURN_FROM_COMPANY_PDA, &payload);
-
-    let metas = vec![
-        AccountMeta::new(transfer_auth, true),              // 0: signer
-        AccountMeta::new_readonly(token_state_pda, false),  // 1
-        AccountMeta::new(mint, false),                      // 2: writable
-        AccountMeta::new_readonly(company_pda, false),      // 3
-        AccountMeta::new(fee_payer, true),                  // 4: writable+signer
-        AccountMeta::new_readonly(system_program_id(), false), // 5
-        AccountMeta::new_readonly(ctoken_prog, false),      // 6
-    ];
-
-    let accounts = vec![
-        (transfer_auth, make_system_account(1_000_000)),
-        (token_state_pda, make_program_account(ts_data, 1_000_000)),
-        (mint, make_token_owned_account(make_mint_data(&token_state_pda, 1_000_000_000, 6))),
-        (company_pda, make_program_account(vec![], 1_000_000)),
-        (fee_payer, make_system_account(10_000_000)),
-        make_program_stub(&system_program_id()),
-        make_program_stub(&ctoken_prog),
-    ];
-
-    (Instruction::new_with_bytes(program_id(), &data, metas), accounts)
-}
-
-#[test]
-fn test_cu_burn_from_company_pda_happy_path() {
-    let mollusk = setup_mollusk();
-    let (ix, accounts) = setup_burn_from_company_pda();
-    let result = run_benchmark(&mollusk, &ix, &accounts);
-    println!("burn_from_company_pda       happy-path CU: {}", result.compute_units_consumed);
-    assert!(
-        result.compute_units_consumed <= MAX_CU_BURN_FROM_COMPANY,
-        "burn_from_company_pda CU {} > max {}",
-        result.compute_units_consumed, MAX_CU_BURN_FROM_COMPANY,
-    );
-}
+// ── 6./7. burn_tokens / burn_from_company_pda — REMOVED in story 3.40 (Z$ is never burned) ──
 
 // ── 8. mint_tokens ───────────────────────────────────────────────────────
 
@@ -1559,8 +1451,6 @@ fn test_cu_benchmark_report() {
     bench!("transfer_user_to_company", "Hot-path", 35_000, MAX_CU_TRANSFER_U2C, setup_transfer_u2c());
     bench!("execute_split_transfer", "Hot-path", 95_000, MAX_CU_SPLIT_TRANSFER, setup_split_transfer());
     bench!("return_to_pool", "Hot-path", 15_000, MAX_CU_RETURN_TO_POOL, setup_return_to_pool());
-    bench!("burn_tokens", "Warm-path", 20_000, MAX_CU_BURN_TOKENS, setup_burn_tokens());
-    bench!("burn_from_company_pda", "Warm-path", 25_000, MAX_CU_BURN_FROM_COMPANY, setup_burn_from_company_pda());
     bench!("mint_tokens", "Hot-path", 20_000, MAX_CU_MINT_TOKENS, setup_mint_tokens());
 
     // Cold-path: inline setup for instructions not reused above
