@@ -88,10 +88,7 @@ fn run_benchmark(
 fn setup_transfer_from_pool() -> (Instruction, Vec<(Pubkey, Account)>) {
     let (token_state_pda, bump) = derive_token_state_pda();
     let transfer_auth = Pubkey::new_unique();
-    // Fixed to the real mainnet ZUPY mint (story 36.3): transfer_from_pool runs
-    // find_program_address(["pool", mint]) on-chain, so a random mint made the CU
-    // depend on how many Pubkey::new_unique() calls ran before (test order).
-    let mint: Pubkey = "ZUPYxKLjfRyRmoF6j8Su8D3aTDkB4k4uqXLqHn8wcao".parse().unwrap();
+    let mint = zupy_mint(); // fixed: see zupy_mint()
     let pool_ata = Pubkey::new_unique();
     let recipient = Pubkey::new_unique();
     let fee_payer = Pubkey::new_unique();
@@ -173,7 +170,7 @@ fn test_cu_transfer_from_pool_error_paused() {
     let mollusk = setup_mollusk();
     let (token_state_pda, bump) = derive_token_state_pda();
     let transfer_auth = Pubkey::new_unique();
-    let mint = Pubkey::new_unique();
+    let mint = zupy_mint();
     let pool_ata = Pubkey::new_unique();
     let ts_data = make_transfer_token_state(&transfer_auth, &mint, &pool_ata, bump, true, true); // PAUSED
 
@@ -243,7 +240,7 @@ fn test_cu_transfer_from_pool_error_paused() {
 fn setup_transfer_c2u() -> (Instruction, Vec<(Pubkey, Account)>) {
     let (token_state_pda, bump) = derive_token_state_pda();
     let transfer_auth = Pubkey::new_unique();
-    let mint = Pubkey::new_unique();
+    let mint = zupy_mint();
     let pool_ata = Pubkey::new_unique();
     let company_id: u64 = 10;
     let user_id: u64 = 20;
@@ -321,7 +318,7 @@ fn test_cu_transfer_company_to_user_happy_path() {
 fn setup_transfer_u2c() -> (Instruction, Vec<(Pubkey, Account)>) {
     let (token_state_pda, bump) = derive_token_state_pda();
     let transfer_auth = Pubkey::new_unique();
-    let mint = Pubkey::new_unique();
+    let mint = zupy_mint();
     let pool_ata = Pubkey::new_unique();
     let user_id: u64 = 1;
     let company_id: u64 = 2;
@@ -397,7 +394,7 @@ fn test_cu_transfer_user_to_company_happy_path() {
 fn setup_split_transfer() -> (Instruction, Vec<(Pubkey, Account)>) {
     let (token_state_pda, bump) = derive_token_state_pda();
     let transfer_auth = Pubkey::new_unique();
-    let mint = Pubkey::new_unique();
+    let mint = zupy_mint();
     let pool_ata = Pubkey::new_unique();
     let (incentive_pool_pda, incentive_bump) = derive_incentive_pool_pda();
     let user_id: u64 = 1;
@@ -481,7 +478,7 @@ fn test_cu_execute_split_transfer_happy_path() {
 fn setup_return_to_pool() -> (Instruction, Vec<(Pubkey, Account)>) {
     let (token_state_pda, bump) = derive_token_state_pda();
     let transfer_auth = Pubkey::new_unique();
-    let mint = Pubkey::new_unique();
+    let mint = zupy_mint();
     let pool_ata = Pubkey::new_unique();
     let company_id: u64 = 42;
     let (company_pda, company_bump) = derive_company_pda(company_id);
@@ -552,7 +549,7 @@ fn test_cu_return_to_pool_happy_path() {
 fn setup_mint_tokens() -> (Instruction, Vec<(Pubkey, Account)>) {
     let (token_state_pda, bump) = derive_token_state_pda();
     let mint_auth = mint_authority();
-    let mint = Pubkey::new_unique();
+    let mint = zupy_mint();
     let treasury_ata = Pubkey::new_unique();
 
     let dummy = Pubkey::new_unique();
@@ -612,7 +609,7 @@ fn test_cu_initialize_token_happy_path() {
     let (token_state_pda, _) = derive_token_state_pda();
     // Story 36.3: init is pinned to the treasury signer + the constant keys.
     let authority = treasury_wallet();
-    let mint = Pubkey::new_unique();
+    let mint = zupy_mint();
     let pool_ata = Pubkey::new_unique();
     let treasury_ata = Pubkey::new_unique();
     let treasury = treasury_wallet();
@@ -666,7 +663,7 @@ fn test_cu_initialize_metadata_happy_path() {
     let mollusk = setup_mollusk();
     let (token_state_pda, bump) = derive_token_state_pda();
     let treasury = treasury_wallet();
-    let mint = Pubkey::new_unique();
+    let mint = zupy_mint();
 
     let dummy = Pubkey::new_unique();
     let ts_data = make_token_state_data(
@@ -714,7 +711,7 @@ fn test_cu_update_metadata_field_happy_path() {
     let mollusk = setup_mollusk();
     let (token_state_pda, bump) = derive_token_state_pda();
     let treasury = treasury_wallet();
-    let mint = Pubkey::new_unique();
+    let mint = zupy_mint();
 
     let dummy = Pubkey::new_unique();
     let ts_data = make_token_state_data(
@@ -760,7 +757,7 @@ fn test_cu_treasury_restock_pool_happy_path() {
     let mollusk = setup_mollusk();
     let (token_state_pda, bump) = derive_token_state_pda();
     let treasury = treasury_wallet();
-    let mint = Pubkey::new_unique();
+    let mint = zupy_mint();
     let pool_ata = Pubkey::new_unique();
     let treasury_ata = Pubkey::new_unique();
 
@@ -805,12 +802,19 @@ fn test_cu_treasury_restock_pool_happy_path() {
     );
 }
 
+/// The real mainnet ZUPY mint. Fixed (story 36.3 review): several handlers run
+/// find_program_address(["pool", mint]) on-chain, so a random mint made CU depend
+/// on how many Pubkey::new_unique() calls ran before (test order).
+fn zupy_mint() -> Pubkey {
+    "ZUPYxKLjfRyRmoF6j8Su8D3aTDkB4k4uqXLqHn8wcao".parse().unwrap()
+}
+
 /// Story 36.2 (F7): run treasury_restock_pool with `state_treasury` stored in
 /// token_state and `signer` signing; returns the raw instruction result.
 fn restock_with_treasury(state_treasury: Pubkey, signer: Pubkey) -> InstructionResult {
     let mollusk = setup_mollusk();
     let (token_state_pda, bump) = derive_token_state_pda();
-    let mint = Pubkey::new_unique();
+    let mint = zupy_mint();
     let pool_ata = Pubkey::new_unique();
     let treasury_ata = Pubkey::new_unique();
     let dummy = Pubkey::new_unique();
@@ -872,7 +876,7 @@ fn test_cu_set_paused_happy_path() {
     let mollusk = setup_mollusk();
     let (token_state_pda, bump) = derive_token_state_pda();
     let treasury = treasury_wallet();
-    let mint = Pubkey::new_unique();
+    let mint = zupy_mint();
 
     let dummy = Pubkey::new_unique();
     let ts_data = make_token_state_data(
@@ -909,7 +913,8 @@ fn test_cu_set_paused_happy_path() {
 #[test]
 fn test_cu_initialize_rate_limit_happy_path() {
     let mollusk = setup_mollusk();
-    let authority = Pubkey::new_unique();
+    // Fixed: initialize_rate_limit derives its PDA from the authority on-chain (see zupy_mint()).
+    let authority = mint_authority();
     let (rate_limit_pda, _) = derive_rate_limit_pda(&authority);
 
     // No payload beyond discriminator
@@ -950,7 +955,7 @@ fn test_cu_create_zupy_card_happy_path() {
     let (zupy_card_pda, _) = derive_zupy_card_pda(&user_ksuid);
     let (card_mint_pda, _) = derive_zupy_card_mint_pda(&user_ksuid);
     let token_account = Pubkey::new_unique();
-    let mint = Pubkey::new_unique();
+    let mint = zupy_mint();
 
     let dummy = Pubkey::new_unique();
     let ts_data = make_token_state_data(
@@ -1011,7 +1016,7 @@ fn test_cu_create_coupon_nft_happy_path() {
     let (user_pda, _) = derive_user_pda_by_ksuid(&user_ksuid);
     let (coupon_mint_pda, _) = derive_coupon_pda(&coupon_ksuid);
     let coupon_ata = Pubkey::new_unique();
-    let mint = Pubkey::new_unique();
+    let mint = zupy_mint();
 
     let dummy = Pubkey::new_unique();
     let ts_data = make_token_state_data(
@@ -1072,7 +1077,7 @@ fn test_cu_mint_coupon_cnft_happy_path() {
     let leaf_owner = Pubkey::new_unique();
     let merkle_tree = Pubkey::new_unique();
     let tree_config = Pubkey::new_unique();
-    let mint = Pubkey::new_unique();
+    let mint = zupy_mint();
 
     let dummy = Pubkey::new_unique();
     let ts_data = make_token_state_data(
@@ -1140,7 +1145,7 @@ fn test_cu_error_paths() {
         let (token_state_pda, bump) = derive_token_state_pda();
         let real_auth = Pubkey::new_unique();
         let wrong_auth = Pubkey::new_unique();
-        let mint = Pubkey::new_unique();
+        let mint = zupy_mint();
         let pool_ata = Pubkey::new_unique();
         let ts_data = make_transfer_token_state(&real_auth, &mint, &pool_ata, bump, true, false);
         let amount: u64 = 1_000_000;
@@ -1211,7 +1216,7 @@ fn test_cu_error_paths() {
     {
         let (token_state_pda, bump) = derive_token_state_pda();
         let transfer_auth = Pubkey::new_unique();
-        let mint = Pubkey::new_unique();
+        let mint = zupy_mint();
         let pool_ata = Pubkey::new_unique();
         let wrong_company = Pubkey::new_unique();
         let ts_data = make_transfer_token_state(&transfer_auth, &mint, &pool_ata, bump, true, false);
@@ -1282,7 +1287,7 @@ fn test_cu_error_paths() {
     {
         let (token_state_pda, bump) = derive_token_state_pda();
         let transfer_auth = Pubkey::new_unique();
-        let mint = Pubkey::new_unique();
+        let mint = zupy_mint();
         let pool_ata = Pubkey::new_unique();
         let (incentive_pool_pda, incentive_bump) = derive_incentive_pool_pda();
         let (user_pda, user_bump) = derive_user_pda(1);
@@ -1522,7 +1527,7 @@ fn test_cu_benchmark_report() {
     {
         let (token_state_pda, _) = derive_token_state_pda();
         let authority = treasury_wallet(); // story 36.3: pinned signer + keys
-        let mint = Pubkey::new_unique();
+        let mint = zupy_mint();
         let mut payload = Vec::new();
         payload.extend_from_slice(treasury_wallet().as_ref());
         payload.extend_from_slice(mint_authority().as_ref());
@@ -1552,7 +1557,7 @@ fn test_cu_benchmark_report() {
     {
         let (token_state_pda, bump) = derive_token_state_pda();
         let treasury = treasury_wallet();
-        let mint = Pubkey::new_unique();
+        let mint = zupy_mint();
         let dummy = Pubkey::new_unique();
         let ts_data = make_token_state_data(&treasury, &dummy, &dummy, &dummy, &dummy, &dummy, &dummy, &mint, bump, true, false);
         let mut payload = Vec::new();
@@ -1584,7 +1589,7 @@ fn test_cu_benchmark_report() {
     {
         let (token_state_pda, bump) = derive_token_state_pda();
         let treasury = treasury_wallet();
-        let mint = Pubkey::new_unique();
+        let mint = zupy_mint();
         let dummy = Pubkey::new_unique();
         let ts_data = make_token_state_data(&treasury, &dummy, &dummy, &dummy, &dummy, &dummy, &dummy, &mint, bump, true, false);
         let mut payload = Vec::new();
@@ -1615,7 +1620,7 @@ fn test_cu_benchmark_report() {
     {
         let (token_state_pda, bump) = derive_token_state_pda();
         let treasury = treasury_wallet();
-        let mint = Pubkey::new_unique();
+        let mint = zupy_mint();
         let pool_ata = Pubkey::new_unique();
         let treasury_ata = Pubkey::new_unique();
         let dummy = Pubkey::new_unique();
@@ -1653,7 +1658,7 @@ fn test_cu_benchmark_report() {
     {
         let (token_state_pda, bump) = derive_token_state_pda();
         let treasury = treasury_wallet();
-        let mint = Pubkey::new_unique();
+        let mint = zupy_mint();
         let dummy = Pubkey::new_unique();
         let ts_data = make_token_state_data(&treasury, &dummy, &dummy, &dummy, &dummy, &dummy, &dummy, &mint, bump, true, false);
         let data = build_ix_data(&DISC_SET_PAUSED, &[1u8]);
@@ -1674,7 +1679,7 @@ fn test_cu_benchmark_report() {
 
     // 14. initialize_rate_limit
     {
-        let authority = Pubkey::new_unique();
+        let authority = mint_authority(); // fixed: PDA derived from it on-chain
         let (rl_pda, _) = derive_rate_limit_pda(&authority);
         let data = build_ix_data(&DISC_INITIALIZE_RATE_LIMIT, &[]);
         let metas = vec![
@@ -1706,7 +1711,7 @@ fn test_cu_benchmark_report() {
         let (user_pda, _) = derive_user_pda_by_ksuid(&user_ksuid);
         let (zupy_card, _) = derive_zupy_card_pda(&user_ksuid);
         let (card_mint, _) = derive_zupy_card_mint_pda(&user_ksuid);
-        let mint = Pubkey::new_unique();
+        let mint = zupy_mint();
         let dummy = Pubkey::new_unique();
         let ts_data = make_token_state_data(&dummy, &mint_auth, &dummy, &dummy, &dummy, &dummy, &dummy, &mint, bump, true, false);
         let mut payload = Vec::new();
@@ -1744,7 +1749,7 @@ fn test_cu_benchmark_report() {
         let coupon_ksuid: [u8; 27] = *b"2NRjKcGrXHKtGVjMXV7qptaXY2B";
         let (user_pda, _) = derive_user_pda_by_ksuid(&user_ksuid);
         let (coupon_mint, _) = derive_coupon_pda(&coupon_ksuid);
-        let mint = Pubkey::new_unique();
+        let mint = zupy_mint();
         let dummy = Pubkey::new_unique();
         let ts_data = make_token_state_data(&dummy, &mint_auth, &dummy, &dummy, &dummy, &dummy, &dummy, &mint, bump, true, false);
         let mut payload = Vec::new();

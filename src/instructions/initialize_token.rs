@@ -151,7 +151,8 @@ pub fn process(
     state.set_mint_authority(mint_authority_pubkey);
     state.set_transfer_authority(transfer_authority_pubkey);
 
-    // Pool/treasury ATAs stored unchecked per spec — validated at use-time by hot-path instructions
+    // Pool/treasury ATAs stored unchecked per spec — validated at use-time by hot-path instructions.
+    // Safe since story 36.3: only the treasury can reach this point.
     let pool_ata_key: &[u8; 32] = pool_ata.address().as_ref().try_into().unwrap();
     state.set_pool_ata(pool_ata_key);
 
