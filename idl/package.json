@@ -1,0 +1,15 @@
+{
+  "name": "zupy-token-program-idl",
+  "private": true,
+  "type": "module",
+  "description": "Codama IDL of zupy-token-program (story 37.1). Dev tooling only \u2014 not a program dependency.",
+  "scripts": {
+    "build": "node build-idl.mjs",
+    "verify": "node verify-idl.mjs"
+  },
+  "devDependencies": {
+    "@codama/nodes": "1.11.0",
+    "@codama/dynamic-parsers": "1.4.2",
+    "@codama/dynamic-codecs": "1.3.0"
+  }
+}

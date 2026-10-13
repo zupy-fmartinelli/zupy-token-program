@@ -26,3 +26,4 @@ sonar-project.properties
 
 # Mainnet fork fixtures (scripts/fetch-mainnet-fixtures.sh, read-only dumps)
 tests/fixtures/mainnet/
+idl/node_modules/
