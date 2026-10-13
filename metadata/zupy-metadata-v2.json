@@ -1,0 +1,25 @@
+{
+  "name": "ZUPY",
+  "symbol": "ZUPY",
+  "description": "ZUPY is the loyalty token of Zupy (zupy.com), a rewards platform for merchants. Customers earn ZUPY for purchases and engagement at participating stores and redeem it for rewards. Token-2022 on Solana; program source: github.com/zupy-fmartinelli/zupy-token-program.",
+  "image": "https://cdn.zupy.com/static/token/zupy/v2/logo-512.png",
+  "external_url": "https://zupy.com",
+  "attributes": [
+    { "trait_type": "Category", "value": "Loyalty Token" },
+    { "trait_type": "Platform", "value": "Zupy" },
+    { "trait_type": "Token Standard", "value": "Token-2022" },
+    { "trait_type": "Decimals", "value": 6 }
+  ],
+  "properties": {
+    "category": "currency",
+    "files": [
+      { "uri": "https://cdn.zupy.com/static/token/zupy/v2/logo-512.png", "type": "image/png" }
+    ]
+  },
+  "extensions": {
+    "website": "https://zupy.com",
+    "twitter": "https://x.com/zupyoficial",
+    "instagram": "https://www.instagram.com/zupyoficial",
+    "linkedin": "https://www.linkedin.com/company/zupy/"
+  }
+}
