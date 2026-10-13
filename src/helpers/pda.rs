@@ -87,6 +87,7 @@ pub fn validate_pda(account_key: &Address, expected_pda: &Address) -> Result<(),
 ///     program_id,
 /// )?;
 /// ```
+///
 /// # Bump: client-supplied, not required to be canonical (story 36.4 — decided)
 /// `seeds` carries the CLIENT's bump; a lower-but-valid bump yields an alias
 /// address for the same `[seed, id]`. Accepted on purpose: every caller is signed
@@ -96,7 +97,7 @@ pub fn validate_pda(account_key: &Address, expected_pda: &Address) -> Result<(),
 /// bump 249 seen on mainnet). The guarantee lives in the backend: it always sends
 /// the canonical bump (`TestBumpsAreCanonical` in
 /// `zuppy/blockchain/tests/test_pda_derivation.py`); mainnet sample 2026-10-13:
-/// 504 client bumps, 0 non-canonical. Revisit if a non-hot-key path ever takes a bump.
+/// 504 company/user bumps, 0 non-canonical. Revisit if a non-hot-key path ever takes a bump.
 #[inline(always)]
 pub fn validate_pda_with_seeds(
     account_key: &Address,
