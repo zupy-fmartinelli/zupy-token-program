@@ -3,7 +3,8 @@ use pinocchio::error::ProgramError;
 use pinocchio::{AccountView, Address, ProgramResult};
 
 use crate::constants::{
-    DAILY_AUTO_LIMIT, PER_TX_AUTO_LIMIT, TOKEN_2022_PROGRAM_ID, TOKEN_DECIMALS, TOKEN_STATE_SEED,
+    DAILY_AUTO_LIMIT, MINT_AUTHORITY_PUBKEY, PER_TX_AUTO_LIMIT, TOKEN_2022_PROGRAM_ID,
+    TOKEN_DECIMALS, TOKEN_STATE_SEED, TRANSFER_AUTHORITY_PUBKEY, TREASURY_WALLET_PUBKEY,
 };
 use crate::error::ZupyTokenError;
 use crate::helpers::cpi::{cpi_create_account, cpi_initialize_metadata_pointer, cpi_initialize_mint};
@@ -22,8 +23,12 @@ const MINT_WITH_METADATA_POINTER_SIZE: u64 = 234;
 ///
 /// One-time program setup: creates TokenState PDA + Token-2022 mint with MetadataPointer.
 ///
+/// Pinned (story 36.3): only `TREASURY_WALLET_PUBKEY` may sign, and the three
+/// authorities in data must equal the compile-time constants — so nobody can
+/// initialize a fresh deployment first with their own keys (front-running).
+///
 /// Accounts (8):
-///   0. authority (writable, signer) — payer
+///   0. authority (writable, signer) — payer; must be TREASURY_WALLET_PUBKEY
 ///   1. token_state (writable) — PDA [TOKEN_STATE_SEED], init 363 bytes
 ///   2. mint (writable, signer) — fresh keypair, Token-2022 mint
 ///   3. pool_ata (writable) — stored in state
@@ -32,7 +37,8 @@ const MINT_WITH_METADATA_POINTER_SIZE: u64 = 234;
 ///   6. token_program (read) — Token-2022
 ///   7. associated_token_program (read)
 ///
-/// Data: treasury (pubkey) + mint_authority (pubkey) + transfer_authority (pubkey)
+/// Data: treasury (pubkey) + mint_authority (pubkey) + transfer_authority (pubkey),
+///       each equal to TREASURY_WALLET_PUBKEY / MINT_AUTHORITY_PUBKEY / TRANSFER_AUTHORITY_PUBKEY
 pub fn process(
     program_id: &Address,
     accounts: &[AccountView],
@@ -61,6 +67,18 @@ pub fn process(
         return Err(ZupyTokenError::InvalidAuthority.into());
     }
     if !mint.is_signer() {
+        return Err(ZupyTokenError::InvalidAuthority.into());
+    }
+
+    // ── Pinned authorities (story 36.3) ────────────────────────────────
+    if authority.address().as_ref() != TREASURY_WALLET_PUBKEY.as_ref()
+        || treasury_pubkey != &TREASURY_WALLET_PUBKEY
+    {
+        return Err(ZupyTokenError::UnauthorizedTreasury.into());
+    }
+    if mint_authority_pubkey != &MINT_AUTHORITY_PUBKEY
+        || transfer_authority_pubkey != &TRANSFER_AUTHORITY_PUBKEY
+    {
         return Err(ZupyTokenError::InvalidAuthority.into());
     }
 

@@ -88,7 +88,10 @@ fn run_benchmark(
 fn setup_transfer_from_pool() -> (Instruction, Vec<(Pubkey, Account)>) {
     let (token_state_pda, bump) = derive_token_state_pda();
     let transfer_auth = Pubkey::new_unique();
-    let mint = Pubkey::new_unique();
+    // Fixed to the real mainnet ZUPY mint (story 36.3): transfer_from_pool runs
+    // find_program_address(["pool", mint]) on-chain, so a random mint made the CU
+    // depend on how many Pubkey::new_unique() calls ran before (test order).
+    let mint: Pubkey = "ZUPYxKLjfRyRmoF6j8Su8D3aTDkB4k4uqXLqHn8wcao".parse().unwrap();
     let pool_ata = Pubkey::new_unique();
     let recipient = Pubkey::new_unique();
     let fee_payer = Pubkey::new_unique();
@@ -607,13 +610,14 @@ fn test_cu_mint_tokens_happy_path() {
 fn test_cu_initialize_token_happy_path() {
     let mollusk = setup_mollusk();
     let (token_state_pda, _) = derive_token_state_pda();
-    let authority = Pubkey::new_unique();
+    // Story 36.3: init is pinned to the treasury signer + the constant keys.
+    let authority = treasury_wallet();
     let mint = Pubkey::new_unique();
     let pool_ata = Pubkey::new_unique();
     let treasury_ata = Pubkey::new_unique();
-    let treasury = Pubkey::new_unique();
-    let mint_auth = Pubkey::new_unique();
-    let transfer_auth = Pubkey::new_unique();
+    let treasury = treasury_wallet();
+    let mint_auth = mint_authority();
+    let transfer_auth = transfer_authority();
 
     // Data: 3 pubkeys
     let mut payload = Vec::new();
@@ -1517,12 +1521,12 @@ fn test_cu_benchmark_report() {
     // 9. initialize_token — run with minimal setup
     {
         let (token_state_pda, _) = derive_token_state_pda();
-        let authority = Pubkey::new_unique();
+        let authority = treasury_wallet(); // story 36.3: pinned signer + keys
         let mint = Pubkey::new_unique();
         let mut payload = Vec::new();
-        payload.extend_from_slice(Pubkey::new_unique().as_ref());
-        payload.extend_from_slice(Pubkey::new_unique().as_ref());
-        payload.extend_from_slice(Pubkey::new_unique().as_ref());
+        payload.extend_from_slice(treasury_wallet().as_ref());
+        payload.extend_from_slice(mint_authority().as_ref());
+        payload.extend_from_slice(transfer_authority().as_ref());
         let data = build_ix_data(&DISC_INITIALIZE_TOKEN, &payload);
         let metas = vec![
             AccountMeta::new(authority, true), AccountMeta::new(token_state_pda, false),
