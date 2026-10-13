@@ -29,6 +29,10 @@ entrypoint!(process_instruction);
 pub const RESERVED_BURN_TOKENS: [u8; 8] = [76, 15, 51, 254, 229, 215, 121, 66];
 /// `burn_from_company_pda` (#12), removed in story 3.40. Reserved: never reuse.
 pub const RESERVED_BURN_FROM_COMPANY_PDA: [u8; 8] = [43, 207, 204, 77, 74, 93, 165, 34];
+/// `return_user_to_pool_v1` (#20), removed in story 36.1. Reserved: never reuse.
+pub const RESERVED_RETURN_USER_TO_POOL_V1: [u8; 8] = [41, 120, 49, 208, 53, 163, 70, 32];
+/// `return_to_pool_v1` (#21), removed in story 36.1. Reserved: never reuse.
+pub const RESERVED_RETURN_TO_POOL_V1: [u8; 8] = [170, 95, 61, 209, 55, 75, 105, 211];
 
 pub fn process_instruction(
     program_id: &Address,
@@ -118,13 +122,12 @@ pub fn process_instruction(
         [151, 33, 221, 193, 7, 214, 10, 199] => {
             instructions::return_user_to_pool::process(program_id, accounts, data)
         }
-        // 20. return_user_to_pool_v1 (V1 CPI passthrough, mainnet)
-        [41, 120, 49, 208, 53, 163, 70, 32] => {
-            instructions::return_user_to_pool_v1::process(program_id, accounts, data)
-        }
-        // 21. return_to_pool_v1 (company→pool V1 CPI passthrough, mainnet)
-        [170, 95, 61, 209, 55, 75, 105, 211] => {
-            instructions::return_to_pool_v1::process(program_id, accounts, data)
+        // 20. return_user_to_pool_v1 / 21. return_to_pool_v1 — REMOVED (story 36.1):
+        // V1 CPI passthroughs that signed with the entity PDA over a client-built
+        // payload without validate_v1_transfer_payload / validate_v1_authority.
+        // RESERVED, never reuse: an old client or a replayed payload fails closed.
+        RESERVED_RETURN_USER_TO_POOL_V1 | RESERVED_RETURN_TO_POOL_V1 => {
+            Err(ProgramError::InvalidInstructionData)
         }
         // 22. consolidate_leaves (story 3.40) — N leaves of one owner → one leaf
         [131, 243, 51, 130, 117, 203, 4, 156] => {
@@ -138,8 +141,8 @@ pub fn process_instruction(
 mod tests {
     use super::*;
 
-    /// The 20 LIVE instructions (names must match Anchor exactly).
-    const INSTRUCTION_NAMES: [&str; 20] = [
+    /// The 18 LIVE instructions (names must match Anchor exactly).
+    const INSTRUCTION_NAMES: [&str; 18] = [
         "initialize_token",
         "initialize_metadata",
         "update_metadata_field",
@@ -157,13 +160,11 @@ mod tests {
         "mint_coupon_cnft",
         "withdraw_to_external",
         "return_user_to_pool",
-        "return_user_to_pool_v1",
-        "return_to_pool_v1",
         "consolidate_leaves",
     ];
 
-    /// The 20 live discriminators, in the same order.
-    const DISCRIMINATORS: [[u8; 8]; 20] = [
+    /// The 18 live discriminators, in the same order.
+    const DISCRIMINATORS: [[u8; 8]; 18] = [
         [38, 209, 150, 50, 190, 117, 16, 54],   // initialize_token
         [35, 215, 241, 156, 122, 208, 206, 212], // initialize_metadata
         [103, 217, 144, 202, 46, 70, 233, 141],  // update_metadata_field
@@ -181,15 +182,16 @@ mod tests {
         [75, 5, 206, 155, 96, 133, 98, 15],      // mint_coupon_cnft
         [114, 198, 185, 119, 169, 163, 29, 251], // withdraw_to_external
         [151, 33, 221, 193, 7, 214, 10, 199],    // return_user_to_pool
-        [41, 120, 49, 208, 53, 163, 70, 32],     // return_user_to_pool_v1
-        [170, 95, 61, 209, 55, 75, 105, 211],    // return_to_pool_v1
         [131, 243, 51, 130, 117, 203, 4, 156],   // consolidate_leaves
     ];
 
-    /// Removed instructions whose discriminators stay reserved (story 3.40).
-    const RESERVED: [(&str, [u8; 8]); 2] = [
+    /// Removed instructions whose discriminators stay reserved (burns: story 3.40;
+    /// V1 return-to-pool passthroughs: story 36.1).
+    const RESERVED: [(&str, [u8; 8]); 4] = [
         ("burn_tokens", RESERVED_BURN_TOKENS),
         ("burn_from_company_pda", RESERVED_BURN_FROM_COMPANY_PDA),
+        ("return_user_to_pool_v1", RESERVED_RETURN_USER_TO_POOL_V1),
+        ("return_to_pool_v1", RESERVED_RETURN_TO_POOL_V1),
     ];
 
     fn sha_disc(name: &str) -> [u8; 8] {
@@ -261,10 +263,11 @@ mod tests {
         }
     }
 
-    /// Story 3.40: the burn discriminators fail closed (no handler, no burn),
-    /// with or without payload.
+    /// Every reserved discriminator fails closed (no handler is routed), with or
+    /// without payload: burns (story 3.40, no burn) and the V1 return-to-pool
+    /// passthroughs (story 36.1, no unvalidated PDA-signed forward).
     #[test]
-    fn test_reserved_burn_discriminators_fail_closed() {
+    fn test_reserved_discriminators_fail_closed() {
         let pid = Address::from(constants::PROGRAM_ID);
         for (name, disc) in RESERVED {
             let mut data = Vec::from(disc);
@@ -286,11 +289,12 @@ mod tests {
         assert_eq!(result.unwrap_err(), ProgramError::NotEnoughAccountKeys);
     }
 
-    /// 20 live instructions + 2 reserved (21 before story 3.40, minus 2 burns, plus consolidate_leaves).
+    /// 18 live instructions + 4 reserved (21 before story 3.40, minus 2 burns, plus
+    /// consolidate_leaves = 20; minus the 2 V1 return-to-pool passthroughs in story 36.1).
     #[test]
-    fn test_exactly_20_live_instructions() {
-        assert_eq!(INSTRUCTION_NAMES.len(), 20);
-        assert_eq!(DISCRIMINATORS.len(), 20);
-        assert_eq!(RESERVED.len(), 2);
+    fn test_exactly_18_live_instructions() {
+        assert_eq!(INSTRUCTION_NAMES.len(), 18);
+        assert_eq!(DISCRIMINATORS.len(), 18);
+        assert_eq!(RESERVED.len(), 4);
     }
 }

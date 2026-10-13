@@ -1,12 +1,13 @@
 //! Shared logic for return-to-pool instructions.
 //!
-//! Two variants parametrized by PDA seed (`COMPANY_SEED` or `USER_SEED`):
+//! [`decompress_to_pool`], parametrized by PDA seed (`COMPANY_SEED` or `USER_SEED`):
+//! decompresses via Light Transfer2 (`cpi_decompress_to_spl`). Used by
+//! `return_to_pool` (company) and `return_user_to_pool` (user).
 //!
-//! - [`decompress_to_pool`]: V2 path — decompresses via Light Transfer2 (`cpi_decompress_to_spl`).
-//!   Used by `return_to_pool` (company) and `return_user_to_pool` (user).
-//!
-//! - [`v1_passthrough_to_pool`]: V1 path — forwards pre-built V1 TRANSFER CPI to mainnet cToken.
-//!   Used by `return_to_pool_v1` (company) and `return_user_to_pool_v1` (user).
+//! The V1 passthrough variant (`return_to_pool_v1` / `return_user_to_pool_v1`)
+//! was removed in story 36.1: it signed with the entity PDA over a client-built
+//! V1 payload without `validate_v1_transfer_payload` / `validate_v1_authority`.
+//! Its discriminators are reserved in `lib.rs`.
 
 use pinocchio::cpi::{Seed, Signer};
 use pinocchio::error::ProgramError;
@@ -15,11 +16,10 @@ use pinocchio::{AccountView, Address, ProgramResult};
 use crate::constants::{
     LIGHT_COMPRESSED_TOKEN_PROGRAM_ID, LIGHT_TOKEN_CPI_AUTHORITY, TOKEN_2022_PROGRAM_ID,
 };
-use crate::helpers::v1_transfer::invoke_v1_transfer_signed;
 use crate::error::ZupyTokenError;
 use crate::helpers::compressed_accounts::{
     cpi_decompress_to_spl, derive_spl_interface_pda,
-    parse_leaf_proof_fields, validate_v1_transfer_disc, DecompressToSplAccounts,
+    parse_leaf_proof_fields, DecompressToSplAccounts,
 };
 use crate::helpers::instruction_data::{parse_string, parse_u64, parse_u8};
 use crate::helpers::memo::validate_memo_format;
@@ -56,8 +56,8 @@ use crate::state::token_state::TokenState;
 /// routes the cToken through the light-system program, whose account prefix is
 /// fixed and position-sensitive — an anonymous tail cannot be validated.
 /// Validate the entity PDA (client bump) + the pool ATA (address matches
-/// token_state, owned by Token-2022). Shared by the decompress + V1-passthrough
-/// return-to-pool paths (dedup).
+/// token_state, owned by Token-2022). Used by the company and user variants of
+/// [`decompress_to_pool`].
 #[inline(always)]
 fn validate_entity_pda_and_pool_ata(
     program_id: &Address,
@@ -200,86 +200,4 @@ pub fn decompress_to_pool(
     )?;
 
     Ok(())
-}
-
-/// Superseded by `decompress_to_pool` (Transfer2 decompress, 109 mainnet
-/// successes since 2026-08-22 — story 3.16 Q3); the backend no longer calls it.
-///
-/// ⚠️ MEASURED 2026-09-29 (story 3.21): the old "DEPRECATED — V1 TRANSFER no
-/// longer in the mainnet cToken" note was WRONG. The mainnet cToken still
-/// dispatches `global:transfer` (successful `transfer_company_to_user`, tx
-/// 66bFvExd…YxHu8). Whether THIS decompress shape still succeeds on mainnet is
-/// NÃO VERIFICADO (no call since the deploy, no simulation).
-///
-/// V1 CPI passthrough: forwards pre-built V1 TRANSFER to cToken program.
-///
-/// Accounts (minimum 6 + CPI accounts):
-///   0. transfer_authority        (signer)
-///   1. token_state               (read)
-///   2. mint                      (read)
-///   3. entity_pda                (read)           — company or user PDA
-///   4. pool_ata                  (read)
-///   5. token_program             (read)
-///   6+ V1 CPI accounts           (client-assembled)
-///
-/// Data: entity_id (0-7) + entity_bump (8) + raw V1 CPI data (9+)
-pub fn v1_passthrough_to_pool(
-    program_id: &Address,
-    accounts: &[AccountView],
-    data: &[u8],
-    pda_seed: &[u8],
-) -> ProgramResult {
-    // ── Account extraction (minimum 6 validation accounts) ─────────────────
-    if accounts.len() < 6 {
-        return Err(ProgramError::NotEnoughAccountKeys);
-    }
-    let transfer_authority = &accounts[0];
-    let token_state_account = &accounts[1];
-    let mint = &accounts[2];
-    let entity_pda = &accounts[3];
-    let pool_ata = &accounts[4];
-    let token_program = &accounts[5];
-
-    // ── Parse instruction data ────────────────────────────────────────────
-    let entity_id_u64 = parse_u64(data, 0)?;
-    let entity_bump = parse_u8(data, 8)?;
-
-    // Raw V1 CPI instruction data starts at offset 9
-    if data.len() <= 9 {
-        return Err(ProgramError::InvalidInstructionData);
-    }
-    let v1_cpi_data = &data[9..];
-
-    // ── Validate V1 TRANSFER discriminator prefix ──────────────────────────
-    validate_v1_transfer_disc(v1_cpi_data)?;
-
-    // ── Common transfer validation (9 checks, Spec §7.1-§7.8) ─────────────
-    validate_transfer_common(
-        program_id,
-        token_state_account,
-        transfer_authority,
-        mint,
-        token_program,
-    )?;
-
-    // ── Entity PDA + pool ATA validation ─────────────────────────────
-    validate_entity_pda_and_pool_ata(
-        program_id,
-        entity_pda,
-        pda_seed,
-        entity_id_u64,
-        entity_bump,
-        token_state_account,
-        pool_ata,
-    )?;
-
-    // ── CPI: Forward V1 TRANSFER to cToken, signing with entity PDA ──────
-    let entity_id_bytes = entity_id_u64.to_le_bytes();
-    let bump_bytes = [entity_bump];
-    let signer_seeds: [Seed; 3] = [
-        Seed::from(pda_seed),
-        Seed::from(entity_id_bytes.as_ref()),
-        Seed::from(bump_bytes.as_ref()),
-    ];
-    invoke_v1_transfer_signed(&accounts[6..], entity_pda, v1_cpi_data, &[Signer::from(&signer_seeds)])
 }

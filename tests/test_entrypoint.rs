@@ -8,8 +8,9 @@ mod helpers;
 use helpers::*;
 use solana_instruction::Instruction;
 
-/// Instruction discriminators exercised here (burns removed in story 3.40 —
-/// see `test_reserved_burn_discriminators_fail_closed`; consolidate_leaves added).
+/// Instruction discriminators exercised here (burns removed in story 3.40, V1
+/// return-to-pool removed in story 36.1 — see
+/// `test_reserved_discriminators_fail_closed_via_mollusk`; consolidate_leaves added).
 const DISCRIMINATORS: [([u8; 8], &str); 16] = [
     ([38, 209, 150, 50, 190, 117, 16, 54], "initialize_token"),
     ([35, 215, 241, 156, 122, 208, 206, 212], "initialize_metadata"),
@@ -29,11 +30,14 @@ const DISCRIMINATORS: [([u8; 8], &str); 16] = [
     ([131, 243, 51, 130, 117, 203, 4, 156], "consolidate_leaves"),
 ];
 
-/// Story 3.40: the removed burn instructions keep their discriminators
-/// RESERVED — they fail closed with InvalidInstructionData, never burn.
-const RESERVED_BURNS: [([u8; 8], &str); 2] = [
+/// Removed instructions keep their discriminators RESERVED — they fail closed
+/// with InvalidInstructionData: the burns (story 3.40, never burn) and the V1
+/// return-to-pool passthroughs (story 36.1, never sign an unvalidated forward).
+const RESERVED: [([u8; 8], &str); 4] = [
     ([76, 15, 51, 254, 229, 215, 121, 66], "burn_tokens"),
     ([43, 207, 204, 77, 74, 93, 165, 34], "burn_from_company_pda"),
+    ([41, 120, 49, 208, 53, 163, 70, 32], "return_user_to_pool_v1"),
+    ([170, 95, 61, 209, 55, 75, 105, 211], "return_to_pool_v1"),
 ];
 
 /// Mollusk instance loads the built program successfully.
@@ -123,14 +127,16 @@ fn test_cu_baseline_entrypoint_dispatch() {
     );
 }
 
-/// Story 3.40: burn_tokens / burn_from_company_pda are gone from the binary;
-/// their discriminators return InvalidInstructionData (with or without data).
+/// Removed instructions are gone from the binary: burn_tokens /
+/// burn_from_company_pda (story 3.40) and return_user_to_pool_v1 /
+/// return_to_pool_v1 (story 36.1). Their discriminators return
+/// InvalidInstructionData (with or without data).
 #[test]
-fn test_reserved_burn_discriminators_fail_closed_via_mollusk() {
+fn test_reserved_discriminators_fail_closed_via_mollusk() {
     use solana_instruction::error::InstructionError;
     let mollusk = setup_mollusk();
     let pid = program_id();
-    for (disc, name) in &RESERVED_BURNS {
+    for (disc, name) in &RESERVED {
         let mut data = disc.to_vec();
         let r = mollusk.process_instruction(&Instruction::new_with_bytes(pid, &data, vec![]), &[]);
         assert_eq!(r.raw_result, Err(InstructionError::InvalidInstructionData), "{name}");
