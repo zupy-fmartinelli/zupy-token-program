@@ -20,29 +20,38 @@ Solana program for the ZUPY token ecosystem, built with the [Pinocchio](https://
 
 ## Build
 
-Requires [Solana CLI](https://docs.solanalabs.com/cli/install) and the SBF toolchain.
+Requires [Solana CLI](https://docs.anza.xyz/cli/install) and the SBF toolchain.
 
 ```bash
-# Build for deployment
-cargo build-sbf
+# Mainnet build. The default feature is `devnet`: a plain `cargo build-sbf`
+# produces a binary with devnet settings, which must never go to mainnet.
+cargo build-sbf --no-default-features --features mainnet
 
 # Unit tests
 cargo test --lib
 
-# Full test suite (requires SBF binary)
-cargo build-sbf && cargo test
+# Full test suite (requires the SBF binary)
+SBF_OUT_DIR=target/deploy cargo test
 ```
 
 ## Verify Build
 
-This program is verified on [Solana Explorer](https://explorer.solana.com/). To verify locally:
+The deployed program is a deterministic build of this repository, verified with
+[solana-verify](https://github.com/Ellipsis-Labs/solana-verifiable-build) and registered with OtterSec
+(status: `https://verify.osec.io/status/ZUPYzr87cgminBywohtbUxnaiFMwXNy8A5pD9cCcvVU`).
+To reproduce it yourself (Docker required):
 
 ```bash
-solana-verify get-program-hash ZUPYzr87cgminBywohtbUxnaiFMwXNy8A5pD9cCcvVU
+solana-verify build --base-image solanafoundation/solana-verifiable-build:3.0.13 \
+    --library-name zupy_token_program -- --no-default-features --features mainnet
 solana-verify get-executable-hash target/deploy/zupy_token_program.so
+solana-verify get-program-hash -u https://api.mainnet-beta.solana.com ZUPYzr87cgminBywohtbUxnaiFMwXNy8A5pD9cCcvVU
 ```
 
 Both hashes must match.
+
+The program interface (Codama IDL) is published on-chain as the program's canonical metadata
+([`idl/`](idl/)), so explorers decode its instructions by name.
 
 ## Architecture
 
