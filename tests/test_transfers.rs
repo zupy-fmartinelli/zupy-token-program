@@ -2455,6 +2455,46 @@ mod withdraw_to_external {
         println!("withdraw_to_external: dest_ata_wrong_owner CU={}", result.compute_units_consumed);
     }
 
+    // ── Test: dest_ata exists, right mint, but another token owner (story 36.2) ──
+    // A Token-2022 account of the ZUPY mint that belongs to someone other than
+    // dest_wallet is not the destination the instruction names → InvalidAuthority.
+
+    #[test]
+    fn test_dest_ata_owned_by_another_wallet() {
+        let mollusk = setup_mollusk();
+        let (token_state_pda, bump) = derive_token_state_pda();
+        let transfer_auth = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let pool_ata = Pubkey::new_unique();
+        let user_id: u64 = 1;
+        let (user_pda, user_bump) = derive_user_pda(user_id);
+        let dest_wallet = Pubkey::new_unique();
+        let someone_else = Pubkey::new_unique();
+        let dest_ata = Pubkey::new_unique();
+        let fee_payer = Pubkey::new_unique();
+
+        let ts_data = make_transfer_token_state(
+            &transfer_auth, &mint, &pool_ata, bump, true, false,
+        );
+        let payload = build_payload(1_000_000, user_id, user_bump, "zupy:v1:withdraw:1");
+        let data = build_ix_data(&DISC_WITHDRAW_TO_EXTERNAL, &payload);
+        let metas = build_ix_metas(
+            &transfer_auth, &token_state_pda, &mint,
+            &user_pda, &dest_wallet, &dest_ata, &fee_payer,
+        );
+        let instruction = Instruction::new_with_bytes(program_id(), &data, metas);
+
+        let mut accounts = build_accounts(
+            &transfer_auth, &token_state_pda, ts_data, &mint,
+            &user_pda, &dest_wallet, &dest_ata, true, &fee_payer,
+        );
+        // Override dest_ata (idx 5): Token-2022 owned, ZUPY mint, owner = someone_else.
+        accounts[5].1.data = make_token_account_data(&mint, &someone_else, 0);
+
+        let result = mollusk.process_instruction(&instruction, &accounts);
+        assert_ix_custom_err(&result, ERR_INVALID_AUTHORITY);
+    }
+
     // ── Invalid user PDA ──────────────────────────────────────────────
 
     #[test]

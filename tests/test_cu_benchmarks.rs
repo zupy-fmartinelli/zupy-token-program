@@ -848,7 +848,8 @@ fn test_restock_authorizes_state_treasury() {
     let state_treasury = Pubkey::new_unique();
     assert_ne!(state_treasury, treasury_wallet());
     let r = restock_with_treasury(state_treasury, state_treasury);
-    assert_ne!(r.raw_result, Err(InstructionError::Custom(6019)), "UnauthorizedTreasury for state.treasury");
+    // Past every check, it reaches the Token-2022 CPI (a stub here), like the happy path.
+    assert_eq!(r.raw_result, Err(InstructionError::UnsupportedProgramId));
 }
 
 /// ...and the hard-coded wallet is refused when token_state names another treasury.
