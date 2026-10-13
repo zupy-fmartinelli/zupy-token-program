@@ -135,8 +135,8 @@ pub fn process(
         return Err(ProgramError::IncorrectProgramId);
     }
 
-    // 10. Validate existing dest_ata if present (mint check) — no-op if account has no data (AC3)
-    validate_destination_ata_if_exists(dest_ata, mint.address())?;
+    // 10. Validate existing dest_ata if present (mint + owner == dest_wallet, story 36.2) — no-op if account has no data (AC3)
+    validate_destination_ata_if_exists(dest_ata, mint.address(), dest_wallet.address())?;
 
     // 11. Create dest_ata for external wallet if it doesn't exist
     // NOTE: withdraw_to_external is the ONLY instruction that creates an ATA since the compressed

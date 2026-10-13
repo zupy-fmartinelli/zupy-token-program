@@ -801,6 +801,65 @@ fn test_cu_treasury_restock_pool_happy_path() {
     );
 }
 
+/// Story 36.2 (F7): run treasury_restock_pool with `state_treasury` stored in
+/// token_state and `signer` signing; returns the raw instruction result.
+fn restock_with_treasury(state_treasury: Pubkey, signer: Pubkey) -> InstructionResult {
+    let mollusk = setup_mollusk();
+    let (token_state_pda, bump) = derive_token_state_pda();
+    let mint = Pubkey::new_unique();
+    let pool_ata = Pubkey::new_unique();
+    let treasury_ata = Pubkey::new_unique();
+    let dummy = Pubkey::new_unique();
+    let ts_data = make_token_state_data(
+        &state_treasury, &dummy, &dummy, &pool_ata, &dummy, &dummy, &treasury_ata,
+        &mint, bump, true, false,
+    );
+    let amount: u64 = 5_000_000;
+    let memo = build_string("zupy:v1:restock:manual");
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&amount.to_le_bytes());
+    payload.extend_from_slice(&memo);
+    let data = build_ix_data(&DISC_TREASURY_RESTOCK_POOL, &payload);
+    let metas = vec![
+        AccountMeta::new_readonly(token_state_pda, false),
+        AccountMeta::new_readonly(mint, false),
+        AccountMeta::new(treasury_ata, false),
+        AccountMeta::new(pool_ata, false),
+        AccountMeta::new(signer, true),
+        AccountMeta::new_readonly(token_2022_id(), false),
+    ];
+    let accounts = vec![
+        (token_state_pda, make_program_account(ts_data, 1_000_000)),
+        (mint, make_token_owned_account(make_mint_data(&token_state_pda, 1_000_000_000, 6))),
+        (treasury_ata, make_token_owned_account(make_token_account_data(&mint, &signer, 50_000_000))),
+        (pool_ata, make_token_owned_account(make_token_account_data(&mint, &token_state_pda, 0))),
+        (signer, make_system_account(1_000_000)),
+        make_program_stub(&token_2022_id()),
+    ];
+    mollusk.process_instruction(&Instruction::new_with_bytes(program_id(), &data, metas), &accounts)
+}
+
+/// Story 36.2 (F7): the treasury is whoever token_state says — not a second,
+/// hard-coded copy. A signer equal to `state.treasury` passes the treasury
+/// check even when it differs from TREASURY_WALLET_PUBKEY...
+#[test]
+fn test_restock_authorizes_state_treasury() {
+    use solana_instruction::error::InstructionError;
+    let state_treasury = Pubkey::new_unique();
+    assert_ne!(state_treasury, treasury_wallet());
+    let r = restock_with_treasury(state_treasury, state_treasury);
+    assert_ne!(r.raw_result, Err(InstructionError::Custom(6019)), "UnauthorizedTreasury for state.treasury");
+}
+
+/// ...and the hard-coded wallet is refused when token_state names another treasury.
+#[test]
+fn test_restock_refuses_signer_other_than_state_treasury() {
+    use solana_instruction::error::InstructionError;
+    let state_treasury = Pubkey::new_unique();
+    let r = restock_with_treasury(state_treasury, treasury_wallet());
+    assert_eq!(r.raw_result, Err(InstructionError::Custom(6019)));
+}
+
 // ── 13. set_paused ───────────────────────────────────────────────────────
 
 #[test]

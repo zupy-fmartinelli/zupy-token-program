@@ -211,7 +211,8 @@ pub fn validate_metadata_accounts(
 /// Validates:
 /// 1. Payer is signer
 /// 2. Base token_state (ownership, PDA, initialized)
-/// 3. Payer matches token_state.mint_authority (AUDIT 12.1)
+/// 3. Not paused → SystemPaused (story 36.2; the pause targets hot keys)
+/// 4. Payer matches token_state.mint_authority (AUDIT 12.1)
 pub fn validate_nft_payer(
     program_id: &Address,
     payer: &AccountView,
@@ -224,6 +225,10 @@ pub fn validate_nft_payer(
     validate_token_state_base(program_id, token_state_account)?;
 
     let state = TokenState::from_slice(unsafe { token_state_account.borrow_unchecked() });
+    // Story 36.2: the pause stops every hot-key path, the NFT mints included.
+    if state.paused() {
+        return Err(ZupyTokenError::SystemPaused.into());
+    }
     let payer_key: &[u8; 32] = payer.address().as_ref().try_into().unwrap();
     if !state.is_mint_authority(payer_key) {
         return Err(ZupyTokenError::InvalidAuthority.into());
@@ -295,11 +300,14 @@ pub fn validate_source_ata(
 }
 
 /// Validate a destination ATA if it already exists (data_len > 0).
-/// Checks: Token-2022 ownership + mint match.
+/// Checks: Token-2022 ownership + mint match + token-account owner ==
+/// `expected_owner` (story 36.2: the account the funds land in must belong to
+/// the wallet the instruction names).
 /// Skips validation if the account has no data (will be created via CPI).
 pub fn validate_destination_ata_if_exists(
     ata: &AccountView,
     expected_mint: &Address,
+    expected_owner: &Address,
 ) -> Result<(), ProgramError> {
     if ata.data_len() > 0 {
         let token_2022_addr = Address::from(TOKEN_2022_PROGRAM_ID);
@@ -308,6 +316,9 @@ pub fn validate_destination_ata_if_exists(
         }
         if read_token_mint(ata) != expected_mint.as_ref() {
             return Err(ZupyTokenError::InvalidMint.into());
+        }
+        if read_token_owner(ata) != expected_owner.as_ref() {
+            return Err(ZupyTokenError::InvalidAuthority.into());
         }
     }
     Ok(())
@@ -390,7 +401,7 @@ pub fn execute_pda_transfer(
     }
 
     // ── Destination ATA validation (if already exists) ────────────────
-    validate_destination_ata_if_exists(dest.ata, ctx.mint.address())?;
+    validate_destination_ata_if_exists(dest.ata, ctx.mint.address(), dest.pda.address())?;
 
     // ── CPI: Create destination ATA if needed ─────────────────────────
     cpi_create_ata_if_needed(
@@ -1111,7 +1122,8 @@ mod tests {
         let (mut buf, _data) = make_account_buf([10u8; 32], [0u8; 32], false, false, 0);
         let view = view_from_buf(&mut buf);
         let mint_addr = Address::from([5u8; 32]);
-        assert!(validate_destination_ata_if_exists(&view, &mint_addr).is_ok());
+        let owner = Address::from([6u8; 32]);
+        assert!(validate_destination_ata_if_exists(&view, &mint_addr, &owner).is_ok());
     }
 
     #[test]
@@ -1120,7 +1132,21 @@ mod tests {
         let mut buf = make_token_2022_account_buf([10u8; 32], mint, [6u8; 32], 1_000);
         let view = view_from_buf(&mut buf);
         let mint_addr = Address::from(mint);
-        assert!(validate_destination_ata_if_exists(&view, &mint_addr).is_ok());
+        let owner = Address::from([6u8; 32]);
+        assert!(validate_destination_ata_if_exists(&view, &mint_addr, &owner).is_ok());
+    }
+
+    /// Story 36.2 (F3): an existing token account of the right mint but another
+    /// owner is not the destination the instruction names.
+    #[test]
+    fn test_validate_dest_ata_existing_wrong_token_owner() {
+        let mint = [5u8; 32];
+        let mut buf = make_token_2022_account_buf([10u8; 32], mint, [7u8; 32], 1_000);
+        let view = view_from_buf(&mut buf);
+        let mint_addr = Address::from(mint);
+        let expected_owner = Address::from([6u8; 32]);
+        let result = validate_destination_ata_if_exists(&view, &mint_addr, &expected_owner);
+        assert_eq!(result.unwrap_err(), ProgramError::Custom(ZupyTokenError::InvalidAuthority as u32));
     }
 
     #[test]
@@ -1131,7 +1157,8 @@ mod tests {
         unsafe { (*raw).owner = Address::from([99u8; 32]); }
         let view = view_from_buf(&mut buf);
         let mint_addr = Address::from(mint);
-        let result = validate_destination_ata_if_exists(&view, &mint_addr);
+        let owner = Address::from([6u8; 32]);
+        let result = validate_destination_ata_if_exists(&view, &mint_addr, &owner);
         assert_eq!(result.unwrap_err(), ProgramError::Custom(ZupyTokenError::InvalidAuthority as u32));
     }
 
@@ -1141,7 +1168,8 @@ mod tests {
         let mut buf = make_token_2022_account_buf([10u8; 32], mint, [6u8; 32], 1_000);
         let view = view_from_buf(&mut buf);
         let wrong_mint = Address::from([88u8; 32]);
-        let result = validate_destination_ata_if_exists(&view, &wrong_mint);
+        let owner = Address::from([6u8; 32]);
+        let result = validate_destination_ata_if_exists(&view, &wrong_mint, &owner);
         assert_eq!(result.unwrap_err(), ProgramError::Custom(ZupyTokenError::InvalidMint as u32));
     }
 
@@ -1469,6 +1497,62 @@ mod tests {
 
         let result = validate_nft_payer(&pid, &payer_view, &ts_view);
         assert_eq!(result.unwrap_err(), ProgramError::Custom(ZupyTokenError::NotInitialized as u32));
+    }
+
+    /// Flip `paused` in a buffer built by `make_full_token_state_account`.
+    fn set_token_state_paused(buf: &mut [u64]) {
+        let header_size = size_of::<RuntimeAccount>();
+        let data = unsafe {
+            let base = buf.as_mut_ptr() as *mut u8;
+            core::slice::from_raw_parts_mut(base.add(header_size), TOKEN_STATE_SIZE)
+        };
+        TokenStateMut::from_slice(data).set_paused(true);
+    }
+
+    /// Story 36.2 (F6): the hot mint_authority cannot mint NFTs while paused.
+    #[test]
+    fn test_validate_nft_payer_paused_returns_system_paused() {
+        let pid_bytes = PROGRAM_ID;
+        let pid = Address::from(pid_bytes);
+        let bump = find_token_state_bump(pid_bytes);
+        let mint_auth = [12u8; 32];
+
+        let mut ts_buf = make_full_token_state_account(
+            pid_bytes, [11u8; 32], mint_auth, [3u8; 32], [8u8; 32], bump, true,
+        );
+        set_token_state_paused(&mut ts_buf);
+        let ts_view = view_from_buf(&mut ts_buf);
+
+        let mut payer_buf = make_account_buf(mint_auth, [0u8; 32], true, false, 0).0;
+        let payer_view = view_from_buf(&mut payer_buf);
+
+        let result = validate_nft_payer(&pid, &payer_view, &ts_view);
+        assert_eq!(result.unwrap_err(), ProgramError::Custom(ZupyTokenError::SystemPaused as u32));
+    }
+
+    /// Story 36.2 scope decision: the treasury (cold key that sets/clears the
+    /// pause) keeps its metadata instructions while paused.
+    #[test]
+    fn test_validate_metadata_accounts_still_ok_when_paused() {
+        let pid_bytes = PROGRAM_ID;
+        let pid = Address::from(pid_bytes);
+        let bump = find_token_state_bump(pid_bytes);
+        let treasury = [11u8; 32];
+        let mint_addr = [8u8; 32];
+
+        let mut ts_buf = make_full_token_state_account(
+            pid_bytes, treasury, [12u8; 32], [3u8; 32], mint_addr, bump, true,
+        );
+        set_token_state_paused(&mut ts_buf);
+        let ts_view = view_from_buf(&mut ts_buf);
+        let mut auth_buf = make_account_buf(treasury, [0u8; 32], true, false, 0).0;
+        let auth_view = view_from_buf(&mut auth_buf);
+        let mut mint_buf = make_account_buf(mint_addr, TOKEN_2022_PROGRAM_ID, false, false, 0).0;
+        let mint_view = view_from_buf(&mut mint_buf);
+        let mut tp_buf = make_account_buf(TOKEN_2022_PROGRAM_ID, [0u8; 32], false, false, 0).0;
+        let tp_view = view_from_buf(&mut tp_buf);
+
+        assert_eq!(validate_metadata_accounts(&pid, &auth_view, &ts_view, &mint_view, &tp_view), Ok(bump));
     }
 
     // ── execute_pda_transfer tests ──────────────────────────────────────

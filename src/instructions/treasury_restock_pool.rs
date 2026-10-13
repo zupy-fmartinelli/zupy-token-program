@@ -1,7 +1,7 @@
 use pinocchio::error::ProgramError;
 use pinocchio::{AccountView, Address, ProgramResult};
 
-use crate::constants::{TOKEN_2022_PROGRAM_ID, TREASURY_WALLET_PUBKEY};
+use crate::constants::TOKEN_2022_PROGRAM_ID;
 use crate::error::ZupyTokenError;
 use crate::helpers::cpi::cpi_transfer;
 use crate::helpers::instruction_data::{parse_string, parse_u64};
@@ -22,7 +22,7 @@ use crate::state::token_state::TokenState;
 ///   1. mint (read) — Token-2022 mint
 ///   2. treasury_ata (writable) — source
 ///   3. pool_ata (writable) — destination
-///   4. treasury_wallet (signer) — hardcoded TREASURY_WALLET_PUBKEY
+///   4. treasury_wallet (signer) — must equal token_state.treasury()
 ///   5. token_program (read) — Token-2022
 ///
 /// Data: amount (u64) + memo (String)
@@ -78,10 +78,13 @@ pub fn process(
         return Err(ZupyTokenError::InvalidPoolAccount.into());
     }
 
-    // ── Treasury wallet: hardcoded address + signer ─────────────────────
-    // Deliberate: uses UnauthorizedTreasury (not assert_key_eq) for clearer error semantics
-    let expected_treasury = Address::from(TREASURY_WALLET_PUBKEY);
-    if treasury_wallet.address() != &expected_treasury {
+    // ── Treasury wallet: token_state.treasury + signer ──────────────────
+    // One source of truth (story 36.2): the same value set_paused and the
+    // metadata pair trust. Deliberate: UnauthorizedTreasury for clearer errors.
+    // Not gated by the pause: the treasury is the cold key that sets/clears it.
+    let treasury_key: &[u8; 32] = treasury_wallet.address().as_ref().try_into()
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+    if !state.is_treasury(treasury_key) {
         return Err(ZupyTokenError::UnauthorizedTreasury.into());
     }
     if !treasury_wallet.is_signer() {
