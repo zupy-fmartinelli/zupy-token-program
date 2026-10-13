@@ -1154,12 +1154,12 @@ mod transfer_company_to_user {
     }
     // ── transfer_company_to_user hardened (story 3.40) ──────────────────
     //
-    // Two layouts. NEW (the 3.41 contract, mirror of user→company):
+    // One layout (the 3.41 contract, mirror of user→company):
     //   company_id | user_id | amount | company_bump | user_bump | memo | V1,
     //   accounts [0..4] + fee_payer, system, cToken, V1 CPI tail from [8].
-    // LEGACY (what the backend sends today, still accepted):
-    //   company_id | user_id | company_bump | user_bump | V1 (V1 at byte 18),
-    //   V1 CPI tail from [5]. Both get the full payload validation.
+    // The LEGACY layout (company_id | user_id | company_bump | user_bump | V1,
+    // V1 at byte 18) was removed in story 36.6: it is refused (`c2u_legacy_ix`
+    // builds it only to prove that).
 
     fn c2u_new_ix(t: &U2c, amount: u64, memo: &str, v1: &[u8], cpi_authority: &Pubkey) -> (Instruction, Vec<(Pubkey, Account)>) {
         let ctoken_prog = ctoken_program_id();
@@ -1304,92 +1304,38 @@ mod transfer_company_to_user {
         assert_eq!(r.raw_result, Err(InstructionError::InvalidInstructionData));
     }
 
+    // Story 36.6 (B-5): the legacy layout is refused. GR23 — the 10 legacy-layout
+    // validation tests were removed with the layout; each property they pinned is
+    // covered on the new layout above (first output = user, change only to the
+    // company, missing change, insufficient, wrong mint, CPI authority, wrong
+    // user PDA, zero amount) or ported below (second output to the user).
+
     #[test]
-    fn test_c2u_legacy_layout_reaches_cpi() {
+    fn test_c2u_legacy_layout_is_refused() {
         let t = u2c_setup();
+        // A payload the old program accepted (it reached the CPI) now fails closed.
         let r = c2u(c2u_legacy_ix(&t, &c2u_v1(&t, 3_000_000, 1_000_000, 2_000_000), &t.company_pda));
-        assert_eq!(r.raw_result, Err(InstructionError::UnsupportedProgramId));
-        println!("transfer_company_to_user (legacy layout) validation CU={}", r.compute_units_consumed);
+        assert_eq!(r.raw_result, Err(InstructionError::InvalidInstructionData));
     }
 
     #[test]
-    fn test_c2u_legacy_layout_whole_leaf_reaches_cpi() {
+    fn test_c2u_legacy_layout_is_refused_before_any_validation() {
+        // Same refusal whatever the payload says (here: no change leaf, which the
+        // old legacy path rejected later with 6029) — no handler step runs.
         let t = u2c_setup();
-        let r = c2u(c2u_legacy_ix(&t, &c2u_v1(&t, 1_000_000, 1_000_000, 0), &t.company_pda));
-        assert_eq!(r.raw_result, Err(InstructionError::UnsupportedProgramId));
+        let r = c2u(c2u_legacy_ix(&t, &c2u_v1(&t, 3_000_000, 1_000_000, 0), &t.company_pda));
+        assert_eq!(r.raw_result, Err(InstructionError::InvalidInstructionData));
     }
 
     #[test]
-    fn test_c2u_legacy_layout_destination_must_be_the_user() {
-        let t = u2c_setup();
-        let v1 = build_v1_transfer(
-            &t.mint, Some([9u8; 128]), &[V1Input::with_proof(3_000_000)],
-            &[(Pubkey::new_unique(), 1_000_000, 0), (t.company_pda, 2_000_000, 0)],
-        );
-        let r = c2u(c2u_legacy_ix(&t, &v1, &t.company_pda));
-        assert_ix_custom_err(&r, ERR_INVALID_PDA);
-    }
-
-    #[test]
-    fn test_c2u_legacy_layout_change_to_third_party_rejected() {
-        let t = u2c_setup();
-        let v1 = build_v1_transfer(
-            &t.mint, Some([9u8; 128]), &[V1Input::with_proof(3_000_000)],
-            &[(t.user_pda, 1_000_000, 0), (Pubkey::new_unique(), 2_000_000, 0)],
-        );
-        let r = c2u(c2u_legacy_ix(&t, &v1, &t.company_pda));
-        assert_ix_custom_err(&r, ERR_INVALID_PDA);
-    }
-
-    #[test]
-    fn test_c2u_legacy_layout_second_output_to_the_user_rejected() {
+    fn test_c2u_new_layout_second_output_to_the_user_rejected() {
         // Change must go back to the company; a 2nd output to the user is an extra leg.
         let t = u2c_setup();
         let v1 = build_v1_transfer(
             &t.mint, Some([9u8; 128]), &[V1Input::with_proof(3_000_000)],
             &[(t.user_pda, 1_000_000, 0), (t.user_pda, 2_000_000, 0)],
         );
-        let r = c2u(c2u_legacy_ix(&t, &v1, &t.company_pda));
-        assert_ix_custom_err(&r, ERR_INVALID_PDA);
-    }
-
-    #[test]
-    fn test_c2u_legacy_layout_zero_amount_rejected() {
-        let t = u2c_setup();
-        let r = c2u(c2u_legacy_ix(&t, &c2u_v1(&t, 1_000_000, 0, 1_000_000), &t.company_pda));
-        assert_ix_custom_err(&r, ERR_ZERO_AMOUNT);
-    }
-
-    #[test]
-    fn test_c2u_legacy_layout_missing_change_would_burn() {
-        let t = u2c_setup();
-        let r = c2u(c2u_legacy_ix(&t, &c2u_v1(&t, 3_000_000, 1_000_000, 0), &t.company_pda));
-        assert_ix_custom_err(&r, 6029);
-    }
-
-    #[test]
-    fn test_c2u_legacy_layout_wrong_mint() {
-        let t = u2c_setup();
-        let v1 = build_v1_transfer(&Pubkey::new_unique(), Some([9u8; 128]), &[V1Input::with_proof(1_000_000)], &[(t.user_pda, 1_000_000, 0)]);
-        let r = c2u(c2u_legacy_ix(&t, &v1, &t.company_pda));
-        assert_ix_custom_err(&r, ERR_INVALID_MINT);
-    }
-
-    #[test]
-    fn test_c2u_legacy_layout_cpi_authority_must_be_company_pda() {
-        let t = u2c_setup();
-        let r = c2u(c2u_legacy_ix(&t, &c2u_v1(&t, 1_000_000, 1_000_000, 0), &t.user_pda));
-        assert_ix_custom_err(&r, ERR_INVALID_PDA);
-    }
-
-    #[test]
-    fn test_c2u_legacy_layout_wrong_user_pda() {
-        let t = u2c_setup();
-        let (mut ix, mut accounts) = c2u_legacy_ix(&t, &c2u_v1(&t, 1_000_000, 1_000_000, 0), &t.company_pda);
-        let impostor = Pubkey::new_unique();
-        ix.accounts[4].pubkey = impostor;
-        accounts.push((impostor, make_program_account(vec![], 1_000_000)));
-        let r = setup_mollusk().process_instruction(&ix, &accounts);
+        let r = c2u(c2u_new_ix(&t, 1_000_000, "zupy:v1:ztransaction:42", &v1, &t.company_pda));
         assert_ix_custom_err(&r, ERR_INVALID_PDA);
     }
 }

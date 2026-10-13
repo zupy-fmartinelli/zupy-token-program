@@ -10,18 +10,17 @@ use crate::helpers::memo::validate_memo_format;
 use crate::helpers::pda::{validate_id_pda, validate_light_ctoken_program};
 use crate::helpers::transfer_validation::validate_transfer_common_compressed;
 use crate::helpers::v1_transfer::{
-    invoke_v1_transfer_signed, v1_first_output, validate_v1_authority, validate_v1_transfer_payload, V1Leg,
+    invoke_v1_transfer_signed, validate_v1_authority, validate_v1_transfer_payload, V1Leg,
 };
 
-/// Validation accounts every layout starts with (`[0..5]`).
+/// Validation accounts the layout starts with (`[0..5]`).
 const C2U_BASE_ACCOUNTS: usize = 5;
-/// LEGACY layout: the V1 cToken CPI tail starts right after the base accounts.
-pub const C2U_LEGACY_V1_CPI_ACCOUNTS_START: usize = C2U_BASE_ACCOUNTS;
-/// NEW layout (story 3.40): `[5] fee_payer, [6] system, [7] cToken`, CPI tail from `[8]`
+/// Layout (story 3.40): `[5] fee_payer, [6] system, [7] cToken`, CPI tail from `[8]`
 /// — byte-for-byte the account layout of `transfer_user_to_company`.
 pub const C2U_V1_CPI_ACCOUNTS_START: usize = 8;
-/// LEGACY layout: the V1 TRANSFER starts at this data offset.
-const C2U_LEGACY_V1_OFFSET: usize = 18;
+/// Where the REMOVED legacy layout carried its V1 TRANSFER (story 36.6): a payload
+/// with the V1 discriminator here is refused, never parsed as the current layout.
+const REMOVED_LEGACY_V1_OFFSET: usize = 18;
 
 /// Process `transfer_company_to_user` (store → customer reward), V1 CPI passthrough.
 ///
@@ -32,7 +31,7 @@ const C2U_LEGACY_V1_OFFSET: usize = 18;
 /// (an `lddw` immediate in the binary). disc=3 (the former `cpi_compressed_transfer`, removed in 36.5) does
 /// NOT work for compressed Z$ (`Custom(18063)`, story 3.17).
 ///
-/// ## 2026-09-30 (story 3.40) — hardened, two layouts
+/// ## 2026-09-30 (story 3.40) — hardened; 2026-10-13 (story 36.6) — one layout
 ///
 /// Up to `da2b261` this instruction checked only the V1 discriminator and the two
 /// PDAs, then signed ANY payload with the company PDA (review of 3.21, deferred:
@@ -56,17 +55,14 @@ const C2U_LEGACY_V1_OFFSET: usize = 18;
 /// payment of a specific ledger row is provable on-chain (story 3.35 found
 /// the company → user carried none).
 ///
-/// **LEGACY layout (what the backend sends up to 3.41, still accepted)**:
-/// ```text
-/// data:     company_id u64 | user_id u64 | company_bump u8 | user_bump u8 | V1 TRANSFER
-/// accounts: 0..4 as above · 5+ V1 cToken CPI accounts (authority = company_pda)
-/// ```
-/// Detected by the V1 discriminator at byte 18. The amount is read from output 0
-/// (which must be the user PDA and > 0); everything else is validated as in the
-/// new layout. Unambiguous: in the new layout bytes 18..26 are the 6 high bytes of
-/// `amount` + the two bumps, which would need `amount ≥ 3·2^56` lamports — far
-/// above the whole supply. Dropping the legacy layout is a later upgrade, after
-/// 3.41 is live (story 3.40, Q1 to the PO).
+/// **LEGACY layout — REMOVED in story 36.6 (zupy-network B-5)**: `company_id |
+/// user_id | company_bump | user_bump | V1 TRANSFER` (no amount, no memo). The
+/// backend sends only the layout above since 3.41 (`COMPANY_TO_USER_V2_LAYOUT_ENABLED`
+/// on in production; 200 of 200 sampled mainnet c2u on 2026-10-13). A payload
+/// with the V1 discriminator at byte 18 is refused with `InvalidInstructionData`
+/// before any check: detected on purpose, so it fails closed with a clear error
+/// instead of being mis-parsed (in the current layout bytes 18..26 are the 6 high
+/// bytes of `amount` + the bumps — `amount ≥ 3·2^56`, far above the supply).
 ///
 /// Discriminator: [8, 143, 213, 13, 143, 247, 145, 33] — UNCHANGED
 pub fn process(
@@ -77,16 +73,15 @@ pub fn process(
     if accounts.len() < C2U_BASE_ACCOUNTS {
         return Err(ProgramError::NotEnoughAccountKeys);
     }
-    let legacy = data.len() >= C2U_LEGACY_V1_OFFSET + 8
-        && data[C2U_LEGACY_V1_OFFSET..C2U_LEGACY_V1_OFFSET + 8] == TRANSFER_V1_DISC;
-    if legacy {
-        process_legacy(program_id, accounts, data)
-    } else {
-        process_new(program_id, accounts, data)
+    let removed_legacy_layout = data.len() >= REMOVED_LEGACY_V1_OFFSET + 8
+        && data[REMOVED_LEGACY_V1_OFFSET..REMOVED_LEGACY_V1_OFFSET + 8] == TRANSFER_V1_DISC;
+    if removed_legacy_layout {
+        return Err(ProgramError::InvalidInstructionData);
     }
+    process_new(program_id, accounts, data)
 }
 
-/// NEW layout: explicit `amount` + mandatory memo; accounts mirror user → company.
+/// The layout: explicit `amount` + mandatory memo; accounts mirror user → company.
 fn process_new(program_id: &Address, accounts: &[AccountView], data: &[u8]) -> ProgramResult {
     if accounts.len() < C2U_V1_CPI_ACCOUNTS_START {
         return Err(ProgramError::NotEnoughAccountKeys);
@@ -110,25 +105,7 @@ fn process_new(program_id: &Address, accounts: &[AccountView], data: &[u8]) -> P
     c2u.validate_and_forward(program_id, accounts, &accounts[C2U_V1_CPI_ACCOUNTS_START..], v1_data)
 }
 
-/// LEGACY layout: no amount/memo in the header; the amount is output 0 of the payload.
-fn process_legacy(program_id: &Address, accounts: &[AccountView], data: &[u8]) -> ProgramResult {
-    let company_id = parse_u64(data, 0)?;
-    let user_id = parse_u64(data, 8)?;
-    let company_bump = parse_u8(data, 16)?;
-    let user_bump = parse_u8(data, 17)?;
-    let v1_data = &data[C2U_LEGACY_V1_OFFSET..];
-
-    let (_, amount) = v1_first_output(v1_data)?;
-    if amount == 0 {
-        return Err(ZupyTokenError::ZeroAmount.into());
-    }
-    validate_transfer_common_compressed(program_id, &accounts[1], &accounts[0], &accounts[2])?;
-
-    let c2u = C2u { company_id, user_id, company_bump, user_bump, amount };
-    c2u.validate_and_forward(program_id, accounts, &accounts[C2U_LEGACY_V1_CPI_ACCOUNTS_START..], v1_data)
-}
-
-/// Header fields both layouts share once parsed.
+/// Header fields once parsed.
 struct C2u {
     company_id: u64,
     user_id: u64,

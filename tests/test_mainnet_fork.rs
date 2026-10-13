@@ -257,9 +257,9 @@ impl Fork {
         ))
     }
 
-    /// Spend a company-owned leaf through the existing `transfer_company_to_user`
-    /// (unchanged mechanism, 75+ mainnet successes) — used as the effect probe.
-    fn company_to_user(&self, v1: &[u8]) -> InstructionResult {
+    /// `transfer_company_to_user` in the LEGACY layout (removed in story 36.6):
+    /// built only to prove the program refuses it.
+    fn company_to_user_legacy(&self, v1: &[u8]) -> InstructionResult {
         let mut payload = Vec::new();
         payload.extend_from_slice(&COMPANY_ID.to_le_bytes());
         payload.extend_from_slice(&USER_ID.to_le_bytes());
@@ -278,7 +278,7 @@ impl Fork {
         ))
     }
 
-    /// `transfer_company_to_user` in the NEW layout (story 3.40): explicit
+    /// `transfer_company_to_user` (the only layout since story 36.6): explicit
     /// amount + memo, accounts mirror user → company, CPI tail from [8].
     fn company_to_user_new(&self, amount: u64, memo: &str, v1: &[u8]) -> InstructionResult {
         let mut payload = Vec::new();
@@ -380,11 +380,11 @@ fn split_moves_exact_legs_with_real_ctoken() {
     let lie = build_v1_transfer(
         &zupy_mint(), None, &[Fork::input(c + 1, company_leaf)], &[(f.user_pda, c + 1, 1)],
     );
-    err(&f.company_to_user(&lie), "company leaf with a wrong amount");
+    err(&f.company_to_user_new(c + 1, "zupy:v1:ztransaction:36", &lie), "company leaf with a wrong amount");
     let spend_company = build_v1_transfer(
         &zupy_mint(), None, &[Fork::input(c, company_leaf)], &[(f.user_pda, c, 1)],
     );
-    ok(&f.company_to_user(&spend_company), "company spends its leaf (exact amount)");
+    ok(&f.company_to_user_new(c, "zupy:v1:ztransaction:36", &spend_company), "company spends its leaf (exact amount)");
 
     // Effect 3: the pool leaf holds exactly `p` for the incentive pool PDA.
     err(&f.pool_self_transfer(p + 1, pool_leaf), "pool leaf with a wrong amount");
@@ -415,7 +415,7 @@ fn split_with_zero_pool_has_no_pool_leaf() {
     let spend = build_v1_transfer(
         &zupy_mint(), None, &[Fork::input(500_000_000, leaf + 1)], &[(f.user_pda, 500_000_000, 1)],
     );
-    ok(&f.company_to_user(&spend), "company spends the whole-leaf output");
+    ok(&f.company_to_user_new(500_000_000, "zupy:v1:ztransaction:36", &spend), "company spends the whole-leaf output");
 }
 
 /// The legacy (396df04 / 3.17 adapter) payload fails closed before any CPI,
@@ -519,7 +519,7 @@ fn consolidate_company_leaves_then_reward_with_real_ctoken() {
     let u = build_v1_transfer(&zupy_mint(), None, &[Fork::input(reward, user_leaf)], &[(f.company_pda, reward, 1)]);
     ok(&f.user_to_company(reward, &u), "user spends the reward leaf");
     let c = build_v1_transfer(&zupy_mint(), None, &[Fork::input(total - reward, change_leaf)], &[(f.user_pda, total - reward, 1)]);
-    ok(&f.company_to_user(&c), "company spends its change leaf (legacy layout still accepted)");
+    ok(&f.company_to_user_new(total - reward, "zupy:v1:ztransaction:36", &c), "company spends its change leaf");
 }
 
 /// What the program refuses before the CPI, and what the real cToken refuses
@@ -589,10 +589,14 @@ fn company_to_user_hardened_with_real_ctoken() {
         &zupy_mint(), None, &[Fork::input(10_000_000, leaf)], &[(f.user_pda, 4_000_000, 1)],
     );
 
-    // Refused before the CPI, both layouts.
-    assert_ix_custom_err(&f.company_to_user(&steal), 6007);
+    // Refused before the CPI.
     assert_ix_custom_err(&f.company_to_user_new(4_000_000, "zupy:v1:ztransaction:1", &steal), 6007);
-    assert_ix_custom_err(&f.company_to_user(&burn), 6029);
+    assert_ix_custom_err(&f.company_to_user_new(4_000_000, "zupy:v1:ztransaction:1", &burn), 6029);
+    // Story 36.6: the legacy layout is refused outright, even with a valid payload.
+    assert_eq!(
+        f.company_to_user_legacy(&good).raw_result,
+        Err(solana_instruction::error::InstructionError::InvalidInstructionData),
+    );
     assert_ix_custom_err(&f.company_to_user_new(3_000_000, "zupy:v1:ztransaction:1", &good), 6005);
     assert_ix_custom_err(&f.company_to_user_new(4_000_000, "ztransaction-1", &good), 6009);
     assert_eq!(
@@ -607,29 +611,35 @@ fn company_to_user_hardened_with_real_ctoken() {
     let u = build_v1_transfer(&zupy_mint(), None, &[Fork::input(4_000_000, user_leaf)], &[(f.company_pda, 4_000_000, 1)]);
     ok(&f.user_to_company(4_000_000, &u), "user spends the reward leaf (exact)");
 
-    // And the legacy layout (what the backend sends today) pays from the change.
-    let legacy = build_v1_transfer(
+    // And the change leaf pays a second reward (the legacy layout of the same
+    // payment is refused first, leaving the leaf intact).
+    let second = build_v1_transfer(
         &zupy_mint(), None, &[Fork::input(6_000_000, change_leaf)],
         &[(f.user_pda, 1_000_000, 1), (f.company_pda, 5_000_000, 1)],
     );
-    let r = f.company_to_user(&legacy);
-    ok(&r, "transfer_company_to_user legacy layout (hardened)");
-    println!("transfer_company_to_user legacy layout (real cToken + Light, 2 outputs): {} CU", r.compute_units_consumed);
+    assert_eq!(
+        f.company_to_user_legacy(&second).raw_result,
+        Err(solana_instruction::error::InstructionError::InvalidInstructionData),
+    );
+    let r = f.company_to_user_new(1_000_000, "zupy:v1:ztransaction:2", &second);
+    ok(&r, "transfer_company_to_user from the change leaf");
+    println!("transfer_company_to_user second reward (real cToken + Light, 2 outputs): {} CU", r.compute_units_consumed);
 }
 
-/// Story 3.40 regression on REAL traffic: every recent successful mainnet
-/// `transfer_company_to_user` (legacy layout, what the backend sends today —
-/// `3-40-evidence/c2u_real_payloads.py.txt` writes the fixture) still passes
-/// the hardened checks: legacy layout detected, PDAs derive from the header,
-/// output 0 = user PDA with amount > 0, change only to the company, CPI
-/// authority = company PDA, full payload validation.
+/// Regression on REAL traffic (story 3.40, rewritten for the single layout in
+/// story 36.6): every recent successful mainnet `transfer_company_to_user` —
+/// `36-6-evidence/c2u_real_payloads_v2.py.txt` writes the fixture — passes the
+/// checks of the current layout: not the removed legacy shape, PDAs/bumps derive
+/// from the header, memo format, output 0 = user PDA with exactly the header
+/// amount, CPI authority = company PDA, full payload validation.
 #[test]
-#[ignore = "needs tests/fixtures/mainnet/c2u_recent.txt (3-40-evidence/c2u_real_payloads.py.txt)"]
+#[ignore = "needs tests/fixtures/mainnet/c2u_recent_v2.txt (36-6-evidence/c2u_real_payloads_v2.py.txt)"]
 fn real_mainnet_company_to_user_payloads_pass_the_hardened_validator() {
     use pinocchio::Address;
+    use zupy_token_program::helpers::memo::validate_memo_format;
     use zupy_token_program::helpers::v1_transfer::{v1_first_output, validate_v1_transfer_payload, V1Leg};
 
-    let text = std::fs::read_to_string(fixtures().join("c2u_recent.txt")).expect("run c2u_real_payloads.py.txt");
+    let text = std::fs::read_to_string(fixtures().join("c2u_recent_v2.txt")).expect("run c2u_real_payloads_v2.py.txt");
     let mut n = 0;
     for line in text.lines().filter(|l| !l.trim().is_empty() && !l.starts_with('#')) {
         let f: Vec<&str> = line.split_whitespace().collect();
@@ -637,18 +647,24 @@ fn real_mainnet_company_to_user_payloads_pass_the_hardened_validator() {
         let (mint, company, user, cpi_authority) = (pk(f[1]), pk(f[2]), pk(f[3]), pk(f[4]));
         assert_eq!(&data[..8], &DISC_C2U);
         let body = &data[8..];
-        assert_eq!(&body[18..26], &V1_TRANSFER_DISC, "{}: legacy layout must be detected", f[5]);
+        assert_ne!(&body[18..26], &V1_TRANSFER_DISC, "{}: removed legacy layout", f[5]);
 
         let company_id = u64::from_le_bytes(body[0..8].try_into().unwrap());
         let user_id = u64::from_le_bytes(body[8..16].try_into().unwrap());
-        assert_eq!(derive_company_pda(company_id), (company, body[16]), "{}: company PDA", f[5]);
-        assert_eq!(derive_user_pda(user_id), (user, body[17]), "{}: user PDA", f[5]);
+        let amount = u64::from_le_bytes(body[16..24].try_into().unwrap());
+        assert_eq!(derive_company_pda(company_id), (company, body[24]), "{}: company PDA", f[5]);
+        assert_eq!(derive_user_pda(user_id), (user, body[25]), "{}: user PDA", f[5]);
         assert_eq!(cpi_authority, company, "{}: CPI authority = company PDA", f[5]);
 
-        let v1 = &body[18..];
-        let (owner, amount) = v1_first_output(v1).unwrap();
+        let memo_len = u32::from_le_bytes(body[26..30].try_into().unwrap()) as usize;
+        let memo = core::str::from_utf8(&body[30..30 + memo_len]).unwrap();
+        assert_eq!(validate_memo_format(memo), Ok(()), "{}: memo {memo}", f[5]);
+
+        let v1 = &body[30 + memo_len..];
+        let (owner, first) = v1_first_output(v1).unwrap();
         assert_eq!(owner, user.as_ref(), "{}: output 0 is the user", f[5]);
         assert!(amount > 0);
+        assert_eq!(first, amount, "{}: output 0 = header amount", f[5]);
         let (mint_a, company_a, user_a) =
             (Address::from(mint.to_bytes()), Address::from(company.to_bytes()), Address::from(user.to_bytes()));
         let legs = [V1Leg { owner: &user_a, amount }];
@@ -656,5 +672,5 @@ fn real_mainnet_company_to_user_payloads_pass_the_hardened_validator() {
         n += 1;
     }
     println!("{n} real mainnet transfer_company_to_user payloads pass the hardened validator");
-    assert!(n > 0);
+    assert!(n >= 20, "too few payloads: {n}");
 }
