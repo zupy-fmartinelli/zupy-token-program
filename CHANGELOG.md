@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 
+## [1.5.0](https://github.com/zupy-fmartinelli/zupy-token-program/compare/v1.4.0...v1.5.0) (2026-10-13)
+
+
+### Features
+
+* **idl:** IDL Codama do programa, provado contra lib.rs e dados reais da mainnet (story 37.1) ([b6c3fd0](https://github.com/zupy-fmartinelli/zupy-token-program/commit/b6c3fd0e1721705009f9d7fe0d705e6e17cdac6f))
+
+
+### Bug Fixes
+
+* **idl:** story 37.1 — 4 achados do code review ([17e1e14](https://github.com/zupy-fmartinelli/zupy-token-program/commit/17e1e140781ad63524b47f6d59815956b05347c0))
+
 ## [1.3.0](https://github.com/zupy-fmartinelli/zupy-token-program/compare/v1.2.0...v1.3.0) (2026-07-03)
 
 
