@@ -84,8 +84,8 @@ fn push_remaining_metas<'a>(metas: &mut Vec<InstructionAccount<'a>>, remaining: 
 
 /// Build instruction-account metas from CPI accounts, forcing `forced_signer` to
 /// be a signer (needed for `invoke_signed`, where our program signs for a PDA
-/// that is not a signer on the outer tx). Dedups the identical loop in the V1
-/// passthrough transfer + return-to-pool paths.
+/// that is not a signer on the outer tx). Used by the V1 transfer CPI
+/// (`invoke_v1_transfer_signed`).
 #[inline(always)]
 pub fn build_metas_forcing_signer<'a>(
     cpi_accounts: &'a [AccountView],

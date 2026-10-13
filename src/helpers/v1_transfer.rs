@@ -337,7 +337,9 @@ pub fn validate_v1_authority(cpi_accounts: &[AccountView], authority: &AccountVi
 /// are forced to signer so the runtime accepts the PDA signature.
 ///
 /// Shared by `transfer_company_to_user`, `transfer_user_to_company`,
-/// `execute_split_transfer` and the deprecated `return_*_v1` passthroughs.
+/// `execute_split_transfer` and `consolidate_leaves` — each validates the payload
+/// and the CPI authority first (the unvalidated `return_*_v1` passthroughs were
+/// removed in story 36.1).
 #[inline(always)]
 pub fn invoke_v1_transfer_signed(
     cpi_accounts: &[AccountView],
