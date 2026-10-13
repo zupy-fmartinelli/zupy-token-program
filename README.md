@@ -39,9 +39,12 @@ SBF_OUT_DIR=target/deploy cargo test
 The deployed program is a deterministic build of this repository, verified with
 [solana-verify](https://github.com/Ellipsis-Labs/solana-verifiable-build) and registered with OtterSec
 (status: `https://verify.osec.io/status/ZUPYzr87cgminBywohtbUxnaiFMwXNy8A5pD9cCcvVU`).
-To reproduce it yourself (Docker required):
+To reproduce it yourself (Docker required), first check out the exact commit OtterSec verified
+(the `commit` field of the status URL above): the package version feeds cargo's metadata hash, so a
+later commit on `main` (for example a release version bump) builds a different binary.
 
 ```bash
+git checkout 17e1e140781ad63524b47f6d59815956b05347c0
 solana-verify build --base-image solanafoundation/solana-verifiable-build:3.0.13 \
     --library-name zupy_token_program -- --no-default-features --features mainnet
 solana-verify get-executable-hash target/deploy/zupy_token_program.so
