@@ -101,8 +101,8 @@ jobs:
       # crate, e a suíte precisa do .so vivo em target/deploy.
       #
       # O binário de mainnet é o artefato que vai on-chain. Compilar sem
-      # --features mainnet embarca os limites de devnet: DAILY_MINT_LIMIT 100x
-      # maior e PER_TX_MINT_LIMIT 200x maior. Ver constants.rs.
+      # --features mainnet embarca o METADATA_URI de devnet (constants.rs). Os
+      # limites de emissão vêm do token_state, não da feature (story 36.5).
       - name: Build SBF (mainnet)
         run: cargo build-sbf --no-default-features --features mainnet
 
