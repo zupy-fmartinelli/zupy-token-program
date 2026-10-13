@@ -18,18 +18,9 @@ pub const METADATA_URI: &str = "ipfs://bafkreifk4n4oqeiz3jj2dhazypt6qhtpnbinh6ks
 // ── Genesis Supply (raw u64 with 6 decimals) ─────────────────────────
 pub const GENESIS_SUPPLY: u64 = 5_000_000_000_000; // 5M ZUPY
 
-// ── Rate Limits ──────────────────────────────────────────────────────
-// Rate limits remain feature-flagged: devnet relaxed for testing/migration
-#[cfg(not(feature = "production"))]
-pub const DAILY_MINT_LIMIT: u64 = 100_000_000_000_000; // 100M
-#[cfg(feature = "production")]
-pub const DAILY_MINT_LIMIT: u64 = 1_000_000_000_000; // 1M
-
-#[cfg(not(feature = "production"))]
-pub const PER_TX_MINT_LIMIT: u64 = 10_000_000_000_000; // 10M
-#[cfg(feature = "production")]
-pub const PER_TX_MINT_LIMIT: u64 = 50_000_000_000; // 50K
-
+// ── Auto-mint limits (stored in token_state by initialize_token; mint_tokens
+// enforces the stored values). The former DAILY_MINT_LIMIT / PER_TX_MINT_LIMIT
+// were never read and were removed in story 36.5.
 pub const PER_TX_AUTO_LIMIT: u64 = 100_000_000_000; // 100K (both envs)
 pub const DAILY_AUTO_LIMIT: u64 = 500_000_000_000; // 500K (both envs)
 
@@ -152,10 +143,8 @@ mod tests {
     }
 
     #[test]
-    fn test_rate_limits_devnet() {
-        // Default feature is devnet — relaxed limits for testing
-        assert_eq!(DAILY_MINT_LIMIT, 100_000_000_000_000);
-        assert_eq!(PER_TX_MINT_LIMIT, 10_000_000_000_000);
+    fn test_auto_mint_limits() {
+        // Stored in token_state by initialize_token (same for every feature)
         assert_eq!(PER_TX_AUTO_LIMIT, 100_000_000_000);
         assert_eq!(DAILY_AUTO_LIMIT, 500_000_000_000);
     }

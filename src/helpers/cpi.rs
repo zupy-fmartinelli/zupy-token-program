@@ -8,7 +8,7 @@ use pinocchio::sysvars::rent::Rent;
 
 use pinocchio_associated_token_account::instructions::Create;
 use pinocchio_system::instructions::CreateAccount;
-use pinocchio_token_2022::instructions::{CloseAccount, InitializeMint2, MintTo, Transfer, TransferChecked};
+use pinocchio_token_2022::instructions::{InitializeMint2, MintTo, Transfer};
 
 /// CPI: Token-2022 Transfer (discriminator `0x03`).
 /// Transfers `amount` tokens from `source` to `destination` using PDA signer seeds.
@@ -26,38 +26,6 @@ pub fn cpi_transfer<'a>(
         to: destination,
         authority,
         amount,
-        token_program,
-    }
-    .invoke_signed(signers)?;
-    Ok(())
-}
-
-/// Account set for a checked-transfer CPI (groups the four `AccountView` refs
-/// so `cpi_transfer_checked` stays under the parameter-count limit, S107).
-pub struct TransferCheckedAccounts<'a> {
-    pub source: &'a AccountView,
-    pub destination: &'a AccountView,
-    pub authority: &'a AccountView,
-    pub mint: &'a AccountView,
-}
-
-/// CPI: Token-2022 TransferChecked.
-/// Transfers `amount` tokens with decimal validation from source to destination.
-#[inline(always)]
-pub fn cpi_transfer_checked(
-    accounts: &TransferCheckedAccounts,
-    amount: u64,
-    decimals: u8,
-    token_program: &Address,
-    signers: &[Signer],
-) -> Result<(), ProgramError> {
-    TransferChecked {
-        from: accounts.source,
-        mint: accounts.mint,
-        to: accounts.destination,
-        authority: accounts.authority,
-        amount,
-        decimals,
         token_program,
     }
     .invoke_signed(signers)?;
@@ -90,26 +58,6 @@ pub fn cpi_create_ata_if_needed<'a>(
         token_program,
     }
     .invoke()?;
-    Ok(())
-}
-
-/// CPI: Token-2022 CloseAccount (discriminator `0x09`).
-/// Closes `account`, sends rent lamports to `destination`. PDA `authority` signs via invoke_signed.
-#[inline(always)]
-pub fn cpi_close_account<'a>(
-    account: &'a AccountView,
-    destination: &'a AccountView,
-    authority: &'a AccountView,
-    token_program: &Address,
-    signers: &[Signer],
-) -> Result<(), ProgramError> {
-    CloseAccount {
-        account,
-        destination,
-        authority,
-        token_program,
-    }
-    .invoke_signed(signers)?;
     Ok(())
 }
 

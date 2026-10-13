@@ -12,9 +12,9 @@
 //!
 //! ## Path B — cToken-account transfer (disc=3) — NOT for compressed Z$
 //!
-//! - [`cpi_compressed_transfer`]: despite the name, the cToken `Transfer` disc=3
-//!   moves **cToken Solana accounts** (decompressed, owned by the cToken
-//!   program). It carries no proof and cannot spend a compressed leaf.
+//! - `cpi_compressed_transfer` (removed in story 36.5): despite the name, the
+//!   cToken `Transfer` disc=3 moves **cToken Solana accounts** (decompressed,
+//!   owned by the cToken program). It carries no proof and cannot spend a compressed leaf.
 //!   Compressed → compressed on mainnet is the V1 TRANSFER passthrough in
 //!   `helpers::v1_transfer` (story 3.21).
 //!
@@ -670,97 +670,6 @@ pub fn cpi_decompress_to_spl(
     Ok(())
 }
 
-// ── Path B: cpi_compressed_transfer ───────────────────────────────────────────
-
-/// Builds the 9-byte instruction data for the Light cToken `Transfer` instruction (disc=3).
-///
-/// Layout (from `light-token-pinocchio 0.22.0` `TransferCpi::invoke_signed`):
-/// ```text
-/// [0]    discriminator = 3 (Transfer)
-/// [1..9] amount (u64 LE)
-/// ```
-///
-/// This is the cToken **account** transfer: `source`/`destination` are cToken
-/// Solana accounts (decompressed, owned by the cToken program), not compressed
-/// leaves. No ValidityProof travels because no leaf is spent.
-#[inline]
-pub(crate) fn build_compressed_transfer_data(amount: u64) -> [u8; 9] {
-    let mut d = [0u8; 9];
-    d[0] = 3u8; // Transfer discriminator
-    d[1..9].copy_from_slice(&amount.to_le_bytes());
-    d
-}
-
-/// CPI: cToken **account** `Transfer` (discriminator = 3).
-///
-/// ⚠️ MEASURED 2026-09-29 — what it can and CANNOT do on mainnet:
-/// - It CANNOT move Z$: Z$ balances are compressed leaves owned by our PDAs,
-///   and the cToken answers `Custom(18063) InvalidTokenOwner` (unsigned mainnet
-///   simulation, story 3.17 — `execute_split_transfer` and, in the 3.17 review,
-///   `transfer_user_to_company`, both built on this helper up to `396df04`).
-/// - It CAN only move tokens between cToken Solana accounts (the decompressed
-///   "light token account" form), which Zupy does not use. NÃO VERIFICADO on
-///   mainnet for that use, since no Zupy flow has such accounts.
-/// - Since story 3.21 no instruction calls it; client spends use the V1
-///   TRANSFER passthrough (`helpers::v1_transfer`). Kept only so the removal is
-///   a separate, reviewed decision.
-///
-/// Calls the Light cToken program (`cTokenmWW8bLPjZEBAUgYy3zKxQZW6VKi7bqNFEVv3m`)
-/// with `Transfer` instruction (discriminator = 3). The `authority` must sign (typically
-/// the source PDA, signing via `signers` seeds).
-///
-/// ## Account order passed to the cToken program
-/// ```text
-/// [0] source      (writable)            — compressed token source owner
-/// [1] destination (writable)            — compressed token destination owner
-/// [2] authority   (readonly, signer)    — source owner signer (PDA)
-/// [3] system_program (readonly)
-/// [4] fee_payer   (writable, signer)
-/// ```
-#[inline(always)]
-#[allow(clippy::too_many_arguments)]
-pub fn cpi_compressed_transfer<'a>(
-    compressed_token_program: &'a AccountView,
-    fee_payer: &'a AccountView,
-    source: &'a AccountView,
-    destination: &'a AccountView,
-    authority: &'a AccountView,
-    system_program: &'a AccountView,
-    amount: u64,
-    signers: &[Signer],
-) -> Result<(), ProgramError> {
-    let data = build_compressed_transfer_data(amount);
-    let prog_id: Address = LIGHT_COMPRESSED_TOKEN_PROGRAM_ID.into();
-
-    let accounts = [
-        InstructionAccount::writable(source.address()),           // [0] source
-        InstructionAccount::writable(destination.address()),      // [1] destination
-        InstructionAccount::readonly_signer(authority.address()), // [2] authority (PDA signer)
-        InstructionAccount::readonly(system_program.address()),   // [3] system_program
-        InstructionAccount::writable_signer(fee_payer.address()), // [4] fee_payer
-    ];
-
-    let instruction = InstructionView {
-        program_id: &prog_id,
-        accounts: &accounts,
-        data: &data,
-    };
-
-    pinocchio::cpi::invoke_signed(
-        &instruction,
-        &[
-            source,
-            destination,
-            authority,
-            system_program,
-            fee_payer,
-            compressed_token_program, // program account LAST
-        ],
-        signers,
-    )?;
-    Ok(())
-}
-
 // ── SPL Interface PDA Derivation ──────────────────────────────────────────────
 
 /// Derive the Light SPL interface PDA address and bump.
@@ -951,55 +860,6 @@ mod tests {
         let (pda, _) = derive_spl_interface_pda(&mint_key);
         let pda_bytes: &[u8] = pda.as_ref();
         assert_ne!(pda_bytes, &[0u8; 32], "spl_interface PDA must not be all-zeros");
-    }
-
-    // ── build_compressed_transfer_data ───────────────────────────────────
-
-    #[test]
-    fn test_build_compressed_transfer_data_discriminator_is_3() {
-        let data = build_compressed_transfer_data(1_000_000);
-        assert_eq!(data[0], 3u8, "first byte must be Transfer discriminator (3)");
-    }
-
-    #[test]
-    fn test_build_compressed_transfer_data_total_length_is_9() {
-        let data = build_compressed_transfer_data(0);
-        assert_eq!(data.len(), 9, "instruction data must be exactly 9 bytes");
-    }
-
-    #[test]
-    fn test_build_compressed_transfer_data_amount_encoded_correctly() {
-        let amount = 42_000_000u64; // 42 ZUPY (6 decimals)
-        let data = build_compressed_transfer_data(amount);
-        let encoded = u64::from_le_bytes(data[1..9].try_into().unwrap());
-        assert_eq!(encoded, amount, "amount (u64 LE) at bytes [1..9]");
-    }
-
-    #[test]
-    fn test_build_compressed_transfer_data_zero_amount() {
-        let data = build_compressed_transfer_data(0);
-        assert_eq!(&data[1..9], &[0u8; 8], "amount=0 encodes as 8 zero bytes");
-    }
-
-    #[test]
-    fn test_build_compressed_transfer_data_max_amount_u64() {
-        let data = build_compressed_transfer_data(u64::MAX);
-        let encoded = u64::from_le_bytes(data[1..9].try_into().unwrap());
-        assert_eq!(encoded, u64::MAX, "handles u64::MAX without truncation");
-    }
-
-    #[test]
-    fn test_build_compressed_transfer_data_is_deterministic() {
-        let a = build_compressed_transfer_data(99_000);
-        let b = build_compressed_transfer_data(99_000);
-        assert_eq!(a, b, "same amount must yield identical instruction data");
-    }
-
-    #[test]
-    fn test_build_compressed_transfer_data_different_amounts_differ() {
-        let a = build_compressed_transfer_data(1_000);
-        let b = build_compressed_transfer_data(2_000);
-        assert_ne!(a, b, "different amounts must yield different instruction data");
     }
 
     // ── build_decompress_to_spl_data ─────────────────────────────────────────

@@ -17,7 +17,7 @@
 //!   contiguous-byte search is what produced the old, wrong "V1 no longer
 //!   present in the mainnet binary" comments.
 //!
-//! The cToken `Transfer` with disc=3 (see `cpi_compressed_transfer`) is a
+//! The cToken `Transfer` with disc=3 (the former `cpi_compressed_transfer`, removed in story 36.5) is a
 //! different instruction: it moves **cToken Solana accounts** (decompressed,
 //! owned by the cToken program). Z$ balances are **compressed leaves** owned by
 //! our PDAs, so disc=3 fails with `Custom(18063) InvalidTokenOwner` (measured

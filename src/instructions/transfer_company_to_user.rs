@@ -29,7 +29,7 @@ const C2U_LEGACY_V1_OFFSET: usize = 18;
 /// `66bFvExdZpcnXirEXS1br2JoxL56Qk1yE7CAuDWvGabZmPSs9tcussJyRvZpvPRS4t7B7wKfqTNUPdak1mBHxYu8`
 /// (slot 451624459); a 1-in-8 sample of 1,000 signatures had 68 successes and 5 errors.
 /// The mainnet cToken dispatches the Anchor `global:transfer` (V1) instruction
-/// (an `lddw` immediate in the binary). disc=3 (`cpi_compressed_transfer`) does
+/// (an `lddw` immediate in the binary). disc=3 (the former `cpi_compressed_transfer`, removed in 36.5) does
 /// NOT work for compressed Z$ (`Custom(18063)`, story 3.17).
 ///
 /// ## 2026-09-30 (story 3.40) — hardened, two layouts

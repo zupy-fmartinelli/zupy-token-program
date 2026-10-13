@@ -638,10 +638,11 @@ mod transfer_company_to_user {
         Pubkey::new_from_array(LIGHT_COMPRESSED_TOKEN_PROGRAM_ID)
     }
 
-    /// Build the 8-account set for transfer_company_to_user (compressed Path B).
+    /// Build the 8-account set for transfer_company_to_user.
     ///
     /// Account layout matches `transfer_company_to_user.rs` and the Python client exactly.
-    /// No ctoken_auth PDA — `cpi_compressed_transfer` uses only accounts[0..7].
+    /// No ctoken_auth PDA (the former Path B `cpi_compressed_transfer`, removed in
+    /// story 36.5, used only accounts[0..7]).
     pub(super) fn build_accounts(
         transfer_auth: &Pubkey,
         token_state_pda: &Pubkey,
