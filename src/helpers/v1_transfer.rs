@@ -418,8 +418,51 @@ mod tests {
         }
     }
 
+    /// Borsh `Option<u64>`: 0 = None, 1 + LE bytes = Some.
+    fn push_opt_u64(inner: &mut Vec<u8>, v: Option<u64>) {
+        match v {
+            Some(x) => {
+                inner.push(1);
+                inner.extend_from_slice(&x.to_le_bytes());
+            }
+            None => inner.push(0),
+        }
+    }
+
+    /// TLV: `Some(empty vec)` (1 + u32 len 0) or `None`.
+    fn push_tlv(inner: &mut Vec<u8>, tlv: bool) {
+        if tlv {
+            inner.extend_from_slice(&[1, 0, 0, 0, 0]);
+        } else {
+            inner.push(0);
+        }
+    }
+
+    fn encode_input(inner: &mut Vec<u8>, i: &Input) {
+        inner.extend_from_slice(&i.amount.to_le_bytes());
+        match i.delegate {
+            Some(d) => inner.extend_from_slice(&[1, d]),
+            None => inner.push(0),
+        }
+        inner.extend_from_slice(&[0, 1]); // tree idx, queue idx
+        inner.extend_from_slice(&42u32.to_le_bytes()); // leaf_index
+        inner.push(0); // prove_by_index
+        inner.extend_from_slice(&3u16.to_le_bytes()); // root_index
+        push_opt_u64(inner, i.lamports);
+        push_tlv(inner, i.tlv);
+    }
+
+    fn encode_output(inner: &mut Vec<u8>, o: &Output) {
+        inner.extend_from_slice(&o.owner);
+        inner.extend_from_slice(&o.amount.to_le_bytes());
+        push_opt_u64(inner, o.lamports);
+        inner.push(0); // merkle_tree_index
+        push_tlv(inner, o.tlv);
+    }
+
     /// Same byte layout the backend's `_build_v1_transfer_compressed_data`
     /// produces (and mainnet tx 66bFv… carries), generalized to N outputs.
+    /// Split into helpers (Sonar S3776: cognitive complexity was 22 > 15).
     fn encode(p: &Payload) -> Vec<u8> {
         let mut inner = Vec::new();
         if p.proof {
@@ -438,54 +481,14 @@ mod tests {
         }
         inner.extend_from_slice(&(p.inputs.len() as u32).to_le_bytes());
         for i in &p.inputs {
-            inner.extend_from_slice(&i.amount.to_le_bytes());
-            match i.delegate {
-                Some(d) => inner.extend_from_slice(&[1, d]),
-                None => inner.push(0),
-            }
-            inner.extend_from_slice(&[0, 1]); // tree idx, queue idx
-            inner.extend_from_slice(&42u32.to_le_bytes()); // leaf_index
-            inner.push(0); // prove_by_index
-            inner.extend_from_slice(&3u16.to_le_bytes()); // root_index
-            match i.lamports {
-                Some(l) => {
-                    inner.push(1);
-                    inner.extend_from_slice(&l.to_le_bytes());
-                }
-                None => inner.push(0),
-            }
-            if i.tlv {
-                inner.extend_from_slice(&[1, 0, 0, 0, 0]);
-            } else {
-                inner.push(0);
-            }
+            encode_input(&mut inner, i);
         }
         inner.extend_from_slice(&(p.outputs.len() as u32).to_le_bytes());
         for o in &p.outputs {
-            inner.extend_from_slice(&o.owner);
-            inner.extend_from_slice(&o.amount.to_le_bytes());
-            match o.lamports {
-                Some(l) => {
-                    inner.push(1);
-                    inner.extend_from_slice(&l.to_le_bytes());
-                }
-                None => inner.push(0),
-            }
-            inner.push(0); // merkle_tree_index
-            if o.tlv {
-                inner.extend_from_slice(&[1, 0, 0, 0, 0]);
-            } else {
-                inner.push(0);
-            }
+            encode_output(&mut inner, o);
         }
         inner.push(p.is_compress);
-        match p.compress_amount {
-            Some(a) => {
-                inner.push(1);
-                inner.extend_from_slice(&a.to_le_bytes());
-            }
-            None => inner.push(0),
-        }
+        push_opt_u64(&mut inner, p.compress_amount);
         if p.cpi_context {
             inner.extend_from_slice(&[1, 0, 1, 0]);
         } else {
